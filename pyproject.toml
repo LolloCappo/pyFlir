@@ -3,6 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
+<<<<<<< HEAD
 name = "pyFlir"         # must be unique on PyPI
 version = "0.1.0"
 description = "Python library fro Flir cameras reading based on GigE protocol"
@@ -16,3 +17,22 @@ keywords = ["example"]
 classifiers = [
     "Programming Language :: Python :: 3",
 ]
+=======
+name = "pyFlir"
+version = "0.1.0"
+description = "Python library for FLIR cameras reading based on GigE protocol"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Lorenzo Capponi", email = "lorenzocapponi@outlook.it" }]
+keywords = ["flir", "gige", "camera", "imaging"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pyflir"]
+>>>>>>> c572c75 (update for publishing)
