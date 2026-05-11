@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pyFlir"         # must be unique on PyPI
+version = "0.1.0"
+description = "Python library fro Flir cameras reading based on GigE protocol"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+
+# Optional but recommended:
+authors = [{ name = "Lorenzo Capponi", email = "lorenzocapponi@outlook.it" }]
+keywords = ["example"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+]
