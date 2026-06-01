@@ -3,29 +3,14 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-<<<<<<< HEAD
-name = "pyFlir"         # must be unique on PyPI
-version = "0.1.0"
-description = "Python library fro Flir cameras reading based on GigE protocol"
-readme = "README.md"
-requires-python = ">=3.8"
-license = { text = "MIT" }
-
-# Optional but recommended:
-authors = [{ name = "Lorenzo Capponi", email = "lorenzocapponi@outlook.it" }]
-keywords = ["example"]
-classifiers = [
-    "Programming Language :: Python :: 3",
-]
-=======
 name = "pyFlir"
-version = "0.1.0"
-description = "Python library for FLIR cameras reading based on GigE protocol"
+version = "0.2.0"
+description = "Pure-Python driver for FLIR thermal cameras over GigE Vision"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Lorenzo Capponi", email = "lorenzocapponi@outlook.it" }]
-keywords = ["flir", "gige", "camera", "imaging"]
+keywords = ["flir", "gige", "camera", "imaging", "infrared", "thermal"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -33,6 +18,15 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
 
+dependencies = [
+    "numpy",
+    "pyGigEVision",
+]
+
+[project.optional-dependencies]
+io = ["pysfmov"]
+tiff = ["tifffile"]
+gui = ["Pillow", "matplotlib"]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/pyflir"]
->>>>>>> c572c75 (update for publishing)
