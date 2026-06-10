@@ -1,0 +1,8 @@
+-r requirements.txt
+pytest
+pytest-cov
+build
+twine
+ruff
+matplotlib
+Pillow
