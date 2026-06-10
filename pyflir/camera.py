@@ -29,7 +29,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-from pyGigEVision import GVCPClient, GVCPError, GVSPReceiver, fetch_genicam_xml
+from pyGigEVision import GVCPClient, GVCPError, GVSPReceiver
 from pyGigEVision.standard import (
     REG_SC_HOST_PORT,
     REG_SC_PACKET_SIZE,
@@ -37,7 +37,7 @@ from pyGigEVision.standard import (
     REG_SC_DEST_ADDR,
 )
 
-from .genicam import parse_genicam_xml, RegNode, reg_to_float, float_to_reg
+from .genicam import parse_genicam_xml, RegNode, reg_to_float, float_to_reg, fetch_genicam_xml
 from . import registers as reg
 
 
@@ -72,6 +72,70 @@ _SFNC_CANDIDATES = {
 
 class CameraError(Exception):
     """Raised for high-level camera operation failures."""
+
+
+def _find_link_local_ip() -> Optional[str]:
+    """Return the local IP of the interface that can reach 169.254.x.x.
+
+    Uses the connected-socket trick rather than hostname resolution, which
+    often resolves to 127.0.1.1 and misses USB-to-GigE dongle adapters on
+    Linux.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("169.254.0.1", 1))
+        ip = s.getsockname()[0]
+        if ip.startswith("169.254."):
+            return ip
+    except OSError:
+        pass
+    finally:
+        s.close()
+    return None
+
+
+def _local_interface_ips() -> list:
+    """Return all non-loopback IPv4 addresses on this host.
+
+    Used to broadcast discovery on every interface so cameras on secondary
+    NICs (e.g. USB-to-GigE dongles) are not missed.
+    """
+    try:
+        import psutil
+        ips = []
+        for addrs in psutil.net_if_addrs().values():
+            for a in addrs:
+                if a.family == socket.AF_INET and not a.address.startswith("127."):
+                    ips.append(a.address)
+        return ips
+    except Exception:
+        return []
+
+
+def _discover_all(timeout: float = 3.0) -> list:
+    """Broadcast discovery on every local interface and merge the results.
+
+    On Linux a socket that is not bound to a specific interface sends its
+    broadcast only via the default route, so cameras reachable via a
+    USB-to-GigE dongle are silently missed.  This function iterates every
+    local IPv4 address and fires a separate discovery broadcast from each,
+    then deduplicates by camera IP.
+    """
+    candidates = _local_interface_ips()
+    if not candidates:
+        # psutil unavailable — fall back to OS-default broadcast
+        return GVCPClient.discover(interface_ip="", timeout=timeout)
+
+    per_iface = max(2.0, timeout / len(candidates))
+    seen: dict = {}
+    for iface_ip in candidates:
+        try:
+            for cam in GVCPClient.discover(interface_ip=iface_ip, timeout=per_iface):
+                if cam["ip"] not in seen:
+                    seen[cam["ip"]] = cam
+        except Exception:
+            pass
+    return list(seen.values())
 
 
 class Camera:
@@ -123,6 +187,11 @@ class Camera:
         self.height: Optional[int] = None
         self.serial: str = ""
         self.model:  str = ""
+        # Number of trailing metadata rows the camera appends to each frame.
+        # These rows are stripped from grab()/read() results and exposed via
+        # the last_metadata_rows attribute after each acquisition.
+        self._metadata_rows: int = 0
+        self.last_metadata_rows: Optional["np.ndarray"] = None
 
     # ------------------------------------------------------------------
     # Context manager
@@ -176,11 +245,15 @@ class Camera:
             return
 
         if not self.ip:
-            logger.debug("Discovering cameras…")
-            found = GVCPClient.discover(
-                interface_ip=self.interface_ip or "",
-                timeout=3.0,
-            )
+            if self.interface_ip:
+                # Caller specified an interface — use it directly.
+                logger.debug("Discovering cameras on interface %s…", self.interface_ip)
+                found = GVCPClient.discover(interface_ip=self.interface_ip, timeout=3.0)
+            else:
+                # Broadcast on every local interface so cameras reachable via
+                # USB-to-GigE dongles are not missed (Linux default-route issue).
+                logger.debug("Discovering cameras on all interfaces…")
+                found = _discover_all(timeout=3.0)
             if not found:
                 raise CameraError(
                     "No GigE Vision cameras found. Check:\n"
@@ -202,10 +275,47 @@ class Camera:
                 self.ip,
             )
 
-        local_ip = self.interface_ip or None
-        self._gvcp = GVCPClient(self.ip, local_ip=local_ip, timeout=self._timeout)
-        self._gvcp.connect()
-        logger.info("Connected to %s", self.ip)
+        # Use the connected-socket trick to pick the right local NIC when
+        # interface_ip was not given explicitly — critical for USB dongles.
+        import time as _time
+        local_ip = self._local_ip()
+        # pyGigEVision's connect() already polls for ACCESS_DENIED up to 15 s.
+        # FLIR cameras can have a heartbeat timeout up to 60 s, so we recreate
+        # the client and retry beyond that limit.
+        _total_wait = 90.0
+        _deadline = _time.monotonic() + _total_wait
+        attempt = 0
+        while True:
+            self._gvcp = GVCPClient(self.ip, local_ip=local_ip, timeout=self._timeout)
+            try:
+                self._gvcp.connect()
+                break
+            except GVCPError as exc:
+                if _time.monotonic() >= _deadline:
+                    raise CameraError(
+                        f"Could not take control of camera at {self.ip}: {exc}\n"
+                        "Another client may hold exclusive access — close FLIR software "
+                        f"or wait for the heartbeat to expire (waited {_total_wait:.0f}s)."
+                    ) from exc
+                attempt += 1
+                logger.debug("CCP attempt %d failed (%s), retrying…", attempt, exc)
+                _time.sleep(1.0)
+        logger.info("Connected to %s via %s", self.ip, local_ip)
+
+        # Auto-load a cached GenICam XML so model/serial are correct immediately.
+        # Search docs/ then the working directory for camera_*.xml files.
+        if not self._nodes:
+            import glob as _glob
+            candidates = (
+                _glob.glob("docs/camera_*.xml")
+                + _glob.glob("camera_*.xml")
+            )
+            if candidates:
+                try:
+                    self.load_xml(candidates[0])
+                    logger.info("Auto-loaded cached XML: %s", candidates[0])
+                except Exception as exc:
+                    logger.debug("Auto-load XML failed: %s", exc)
 
     def disconnect(self) -> None:
         """Stop streaming (if active), release CCP control, close sockets."""
@@ -292,6 +402,46 @@ class Camera:
         except (KeyError, CameraError) as exc:
             logger.warning("Could not read image dimensions: %s", exc)
 
+        # Detect FLIR metadata rows (e.g. A6751sc reports Height=513 but
+        # the detector is 512 rows; the extra row contains per-frame telemetry).
+        self._metadata_rows = 0
+        sensor_h_node = self._nodes.get("SensorHeight")
+        if sensor_h_node is None:
+            # Fall back to FLIR bootstrap register 0x4E058004
+            try:
+                sensor_h = self._gvcp.read_reg(0x4E058004)
+                if sensor_h and self.height and sensor_h < self.height:
+                    self._metadata_rows = self.height - sensor_h
+                    self.height = sensor_h
+                    logger.info(
+                        "Detected %d metadata row(s); effective height → %d",
+                        self._metadata_rows, self.height,
+                    )
+            except Exception:
+                pass
+
+        # Populate model / serial from StringReg nodes when not already set
+        # by discovery.  Try SFNC names first, then FLIR-specific aliases.
+        for attr, candidates in (
+            # FLIR-specific registers hold the product name (e.g. "A6751sc");
+            # DeviceModelName is the platform / firmware family name ("Xsc Series").
+            # Always overwrite — GVCP discovery values are less specific than XML registers.
+            ("model",  ["CameraModel", "MfgDeviceModelName", "DeviceModelName"]),
+            ("serial", ["CameraSerial", "DeviceSerialNumber", "DeviceID"]),
+        ):
+            for feat in candidates:
+                node = self._nodes.get(feat)
+                if node is None or node.node_type != "StringReg":
+                    continue
+                try:
+                    raw = self._gvcp.read_mem(node.address, node.length)
+                    value = raw.split(b"\x00")[0].decode("ascii", errors="replace").strip()
+                    if value:
+                        setattr(self, attr, value)
+                        break
+                except Exception:
+                    pass
+
     # ------------------------------------------------------------------
     # Streaming
     # ------------------------------------------------------------------
@@ -366,6 +516,13 @@ class Camera:
     # Frame acquisition
     # ------------------------------------------------------------------
 
+    def _strip_metadata(self, frame: np.ndarray) -> np.ndarray:
+        """Strip trailing metadata rows and cache them in last_metadata_rows."""
+        if self._metadata_rows and frame.shape[0] > self._metadata_rows:
+            self.last_metadata_rows = frame[-self._metadata_rows:]
+            return frame[:-self._metadata_rows]
+        return frame
+
     def grab(self, timeout: float = 5.0) -> np.ndarray:
         """Start streaming, capture one frame, stop streaming, and return it.
 
@@ -416,7 +573,7 @@ class Camera:
                     "  • SC_PACKET_SIZE ≤ network MTU\n"
                     "  • Camera is not in trigger mode"
                 )
-            return frame
+            return self._strip_metadata(frame)
 
         frame = self._gvsp.get_frame(timeout=timeout)
         if frame is None:
@@ -426,7 +583,7 @@ class Camera:
                 "  • SC_PACKET_SIZE ≤ network MTU\n"
                 "  • Camera is not in trigger mode"
             )
-        return frame
+        return self._strip_metadata(frame)
 
     def acquire(self, n_frames: int, timeout: float = 30.0) -> List[np.ndarray]:
         """Capture exactly ``n_frames`` frames and return them as a list.
@@ -458,7 +615,7 @@ class Camera:
                     )
                 frame = self._gvsp.get_frame(timeout=min(remaining, 2.0))
                 if frame is not None:
-                    frames.append(frame)
+                    frames.append(self._strip_metadata(frame))
             return frames
         finally:
             if managed:
@@ -683,11 +840,15 @@ class Camera:
     # ------------------------------------------------------------------
 
     def get_roi(self) -> dict:
-        """Return current ROI as ``{width, height, offset_x, offset_y}``."""
+        """Return current ROI as ``{width, height, offset_x, offset_y}``.
+
+        ``height`` reflects the usable image rows only; any trailing metadata
+        rows appended by the camera firmware are excluded.
+        """
         self._require_connected()
         return {
             "width":    self.read_int("Width"),
-            "height":   self.read_int("Height"),
+            "height":   self.read_int("Height") - self._metadata_rows,
             "offset_x": self._gvcp.read_reg(reg.REG_OFFSET_X),
             "offset_y": self._gvcp.read_reg(reg.REG_OFFSET_Y),
         }
@@ -762,9 +923,10 @@ class Camera:
         self._gvcp.write_reg(reg.REG_OFFSET_X, offset_x)
         self._gvcp.write_reg(reg.REG_OFFSET_Y, offset_y)
         self.write_int("Width", width)
-        self.write_int("Height", height)
+        # Write image rows + metadata rows so the camera gets the correct total
+        self.write_int("Height", height + self._metadata_rows)
         self.width  = self.read_int("Width")
-        self.height = self.read_int("Height")
+        self.height = self.read_int("Height") - self._metadata_rows
         max_fps = self.frame_rate_max
         fps_str = f"  max FPS now: {max_fps:.1f} Hz" if max_fps else ""
         logger.info(
@@ -964,4 +1126,6 @@ def discover(
         for cam in cameras:
             print(cam["manufacturer"], cam["model"], cam["ip"])
     """
-    return GVCPClient.discover(interface_ip=interface_ip or "", timeout=timeout)
+    if interface_ip:
+        return GVCPClient.discover(interface_ip=interface_ip, timeout=timeout)
+    return _discover_all(timeout=timeout)

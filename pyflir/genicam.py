@@ -10,10 +10,15 @@ Supports the most common node types with direct <Address> tags:
 Nodes whose address is computed via <pAddress> or IntSwissKnife are
 skipped — these are a small minority in typical FLIR XMLs.
 """
+import io
 import struct
+import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+
+# Bootstrap register address for FIRST_URL (GigE Vision spec, §16.3)
+_REG_FIRST_URL = 0x00000200
 
 
 @dataclass
@@ -118,6 +123,72 @@ def parse_genicam_xml(xml_bytes: bytes) -> Dict[str, RegNode]:
             nodes[name] = node
 
     return nodes
+
+
+# ---------------------------------------------------------------------------
+# Robust XML downloader (works around pyGigEVision's hex-prefix assumption)
+# ---------------------------------------------------------------------------
+
+def _parse_url_int(s: str, flir_bare_hex: bool = False) -> int:
+    """Parse one numeric field from a GigE Vision FIRST_URL.
+
+    Standard cameras use '0x'-prefixed hex or plain decimal.
+    FLIR cameras omit the '0x' prefix on both the address and the size
+    fields.  When *flir_bare_hex* is True the string is always decoded
+    as hexadecimal regardless of whether it contains a–f.
+    """
+    s = s.strip()
+    if flir_bare_hex or any(c in s.lower() for c in "abcdef"):
+        return int(s, 16)
+    return int(s, 0)
+
+
+def _read_mem_aligned(gvcp_client, addr: int, size: int, chunk: int = 512) -> bytes:
+    """Read *size* bytes from *addr*, rounding every chunk to a 4-byte multiple.
+
+    The FLIR A6751sc (and possibly other FLIR cameras) rejects READMEM
+    requests whose byte-count is not a multiple of 4.  This wrapper rounds
+    each chunk up and trims the result to the requested size.
+    """
+    result = bytearray()
+    offset = 0
+    while offset < size:
+        want = min(chunk, size - offset)
+        # Round up to next multiple of 4
+        aligned = (want + 3) & ~3
+        data = gvcp_client._read_mem_raw(addr + offset, aligned)
+        result.extend(data[:want])
+        offset += want
+    return bytes(result)
+
+
+def fetch_genicam_xml(gvcp_client) -> tuple:
+    """Download and return (xml_bytes, filename) from the camera.
+
+    Works around two pyGigEVision bugs seen with FLIR cameras:
+    1. Hex addresses in FIRST_URL without '0x' prefix cause ValueError.
+    2. READMEM rejects byte-counts that are not multiples of 4.
+    """
+    url_bytes = gvcp_client.read_mem(_REG_FIRST_URL, 512)
+    url = url_bytes.split(b"\x00", 1)[0].decode("ascii", errors="replace")
+    parts = url.split(";")
+    if len(parts) < 3:
+        raise ValueError(f"Malformed FIRST_URL: {url!r}")
+    filename = parts[0].split(":")[-1]
+    # If the address field contains a–f (no 0x prefix) it is FLIR-style bare
+    # hex — treat the size field as bare hex too (same convention, same URL).
+    flir_hex = any(c in parts[1].lower() for c in "abcdef")
+    addr = _parse_url_int(parts[1], flir_bare_hex=flir_hex)
+    size = _parse_url_int(parts[2], flir_bare_hex=flir_hex)
+
+    data = _read_mem_aligned(gvcp_client, addr, size)
+
+    if filename.lower().endswith(".zip"):
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            xml_name = next(n for n in zf.namelist() if n.lower().endswith(".xml"))
+            return zf.read(xml_name), xml_name
+
+    return data, filename
 
 
 # ---------------------------------------------------------------------------
