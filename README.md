@@ -6,9 +6,8 @@ required; communicates directly via GVCP/GVSP protocols over UDP using
 
 Supported cameras:
 
-- FLIR Xsc-series (tested)
-- FLIR A-series GigE Vision cameras (should work, untested)
-- Other FLIR GigE Vision cameras (GenICam-compliant)
+- FLIR A-series GigE Vision cameras (tested on A6751sc)
+- Other FLIR GigE Vision cameras (GenICam-compliant, untested)
 
 ## Features
 
@@ -21,19 +20,12 @@ Supported cameras:
 - **Radiometry** — emissivity, distance, atmospheric temperature, humidity
 - **Temperature sensors** — read all on-board thermistors
 - **NUC** — trigger non-uniformity correction, flag-in-FOV / stow
-- **GUI viewer & CLI** — live thermal display, `pyflir discover / grab / live`
 - **File I/O** — read FLIR ATS and SFMOV recorded files
 
 ## Installation
 
 ```bash
 pip install pyFlir
-```
-
-For the GUI live viewer:
-
-```bash
-pip install pyFlir[gui]
 ```
 
 ## Quick start
@@ -151,20 +143,6 @@ finally:
     cam.stop_stream()
 ```
 
-## Live viewer
-
-```python
-with Camera() as cam:
-    cam.load_xml("camera_xxx.xml")
-    cam.live_view()
-```
-
-Or from the command line:
-
-```bash
-pyflir live
-```
-
 ## File I/O
 
 ```python
@@ -180,7 +158,6 @@ frames, meta = read_sfmov("recording.sfmov")
 pyflir discover               # find cameras on the network
 pyflir info                   # show camera configuration
 pyflir grab -o frame.npy      # grab a single frame
-pyflir live                   # open live viewer
 pyflir setup                  # configure OS (firewall, MTU)
 ```
 
