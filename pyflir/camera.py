@@ -94,50 +94,6 @@ def _find_link_local_ip() -> Optional[str]:
     return None
 
 
-def _local_interface_ips() -> list:
-    """Return all non-loopback IPv4 addresses on this host.
-
-    Used to broadcast discovery on every interface so cameras on secondary
-    NICs (e.g. USB-to-GigE dongles) are not missed.
-    """
-    try:
-        import psutil
-        ips = []
-        for addrs in psutil.net_if_addrs().values():
-            for a in addrs:
-                if a.family == socket.AF_INET and not a.address.startswith("127."):
-                    ips.append(a.address)
-        return ips
-    except Exception:
-        return []
-
-
-def _discover_all(timeout: float = 3.0) -> list:
-    """Broadcast discovery on every local interface and merge the results.
-
-    On Linux a socket that is not bound to a specific interface sends its
-    broadcast only via the default route, so cameras reachable via a
-    USB-to-GigE dongle are silently missed.  This function iterates every
-    local IPv4 address and fires a separate discovery broadcast from each,
-    then deduplicates by camera IP.
-    """
-    candidates = _local_interface_ips()
-    if not candidates:
-        # psutil unavailable — fall back to OS-default broadcast
-        return GVCPClient.discover(interface_ip="", timeout=timeout)
-
-    per_iface = max(2.0, timeout / len(candidates))
-    seen: dict = {}
-    for iface_ip in candidates:
-        try:
-            for cam in GVCPClient.discover(interface_ip=iface_ip, timeout=per_iface):
-                if cam["ip"] not in seen:
-                    seen[cam["ip"]] = cam
-        except Exception:
-            pass
-    return list(seen.values())
-
-
 class Camera:
     """FLIR GigE Vision camera controller.
 
@@ -245,15 +201,16 @@ class Camera:
             return
 
         if not self.ip:
-            if self.interface_ip:
-                # Caller specified an interface — use it directly.
-                logger.debug("Discovering cameras on interface %s…", self.interface_ip)
-                found = GVCPClient.discover(interface_ip=self.interface_ip, timeout=3.0)
-            else:
-                # Broadcast on every local interface so cameras reachable via
-                # USB-to-GigE dongles are not missed (Linux default-route issue).
-                logger.debug("Discovering cameras on all interfaces…")
-                found = _discover_all(timeout=3.0)
+            # With an empty interface_ip pyGigEVision broadcasts on every
+            # local interface, so cameras reachable via USB-to-GigE dongles
+            # are not missed (Linux default-route issue).
+            logger.debug(
+                "Discovering cameras on %s…",
+                self.interface_ip or "all interfaces",
+            )
+            found = GVCPClient.discover(
+                interface_ip=self.interface_ip, timeout=3.0
+            )
             if not found:
                 raise CameraError(
                     "No GigE Vision cameras found. Check:\n"
@@ -1116,8 +1073,9 @@ def discover(
         timeout: Seconds to wait for discovery replies.
 
     Returns:
-        List of dicts with keys: ip, manufacturer, model,
-        device_version, serial, user_name.
+        List of dicts with keys: ip, mac, spec_version, manufacturer,
+        model, device_version, manufacturer_info, serial, user_name,
+        interface_ip (the local NIC that received the reply).
 
     Example::
 
@@ -1126,6 +1084,4 @@ def discover(
         for cam in cameras:
             print(cam["manufacturer"], cam["model"], cam["ip"])
     """
-    if interface_ip:
-        return GVCPClient.discover(interface_ip=interface_ip, timeout=timeout)
-    return _discover_all(timeout=timeout)
+    return GVCPClient.discover(interface_ip=interface_ip or "", timeout=timeout)
