@@ -247,7 +247,7 @@ class Camera:
                 if _time.monotonic() >= _deadline:
                     raise CameraError(
                         f"Could not take control of camera at {self.ip}: {exc}\n"
-                        "Another client may hold exclusive access — close FLIR software "
+                        "Another client may hold exclusive access; close FLIR software "
                         f"or wait for the heartbeat to expire (waited {_total_wait:.0f}s)."
                     ) from exc
                 attempt += 1
@@ -378,7 +378,7 @@ class Camera:
         for attr, candidates in (
             # FLIR-specific registers hold the product name (e.g. "A6751sc");
             # DeviceModelName is the platform / firmware family name ("Xsc Series").
-            # Always overwrite — GVCP discovery values are less specific than XML registers.
+            # Always overwrite; GVCP discovery values are less specific than XML registers.
             ("model",  ["CameraModel", "MfgDeviceModelName", "DeviceModelName"]),
             ("serial", ["CameraSerial", "DeviceSerialNumber", "DeviceID"]),
         ):
@@ -419,7 +419,7 @@ class Camera:
             return
 
         if self.width is None or self.height is None:
-            raise CameraError("Image dimensions unknown — call load_xml() first.")
+            raise CameraError("Image dimensions unknown; call load_xml() first.")
 
         local_ip = self._local_ip()
 
@@ -508,7 +508,7 @@ class Camera:
             CameraError: If not streaming or no frame arrives in time.
         """
         if not self._streaming or self._gvsp is None:
-            raise CameraError("Not streaming — call start_stream() first.")
+            raise CameraError("Not streaming; call start_stream() first.")
 
         if latest:
             frame = None
@@ -895,7 +895,7 @@ class Camera:
         """Apply the stored NUC correction coefficients for the given preset.
 
         Loads pre-computed correction data (PS0–PS3) into the active pipeline.
-        Does not compute a new NUC — to do that, move the physical flag into
+        Does not compute a new NUC; to do that, move the physical flag into
         the FOV, capture a flat-field frame, then save and re-apply.
 
         Args:
@@ -1034,11 +1034,11 @@ class Camera:
 
     def _require_connected(self) -> None:
         if self._gvcp is None:
-            raise CameraError("Not connected — call connect() first.")
+            raise CameraError("Not connected; call connect() first.")
 
     def _get_node(self, feature: str) -> RegNode:
         if not self._nodes:
-            raise CameraError("Register map not loaded — call load_xml() first.")
+            raise CameraError("Register map not loaded; call load_xml() first.")
         resolved = self._aliases.get(feature, feature)
         if resolved not in self._nodes:
             raise KeyError(f"Feature '{feature}' not found in register map.")

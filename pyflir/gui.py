@@ -58,7 +58,7 @@ class LiveView:
     """Tkinter-based live thermal image viewer for FLIR cameras.
 
     Displays raw 16-bit sensor counts (DN) with colormap normalization.
-    Streaming must not be active when this is called — LiveView manages
+    Streaming must not be active when this is called; LiveView manages
     the stream lifecycle itself.
 
     Args:
@@ -76,7 +76,7 @@ class LiveView:
         self.height = camera.height or 0
         if self.width == 0 or self.height == 0:
             raise RuntimeError(
-                "Image dimensions unknown — call cam.load_xml() before live_view()."
+                "Image dimensions unknown; call cam.load_xml() before live_view()."
             )
 
         self.cmap_name = colormap

@@ -8,7 +8,7 @@ Supports the most common node types with direct <Address> tags:
   Register, StringReg
 
 Nodes whose address is computed via <pAddress> or IntSwissKnife are
-skipped — these are a small minority in typical FLIR XMLs.
+skipped; these are a small minority in typical FLIR XMLs.
 """
 import struct
 import xml.etree.ElementTree as ET

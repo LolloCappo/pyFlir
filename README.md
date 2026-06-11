@@ -11,16 +11,16 @@ Supported cameras:
 
 ## Features
 
-- **Auto-discovery** — finds cameras on the network regardless of IP
-- **GenICam XML-driven** — downloads and parses the camera's feature descriptor;
+- **Auto-discovery**: finds cameras on the network regardless of IP
+- **GenICam XML-driven**: downloads and parses the camera's feature descriptor;
   no hardcoded register maps for standard features
-- **Live streaming** — real-time frame acquisition, `read(latest=True)` for lag-free display
-- **ROI / subwindow** — configurable resolution for higher frame rates
-- **Calibration blocks** — list and select temperature-range calibration presets
-- **Radiometry** — emissivity, distance, atmospheric temperature, humidity
-- **Temperature sensors** — read all on-board thermistors
-- **NUC** — trigger non-uniformity correction, flag-in-FOV / stow
-- **File I/O** — read FLIR ATS and SFMOV recorded files
+- **Live streaming**: real-time frame acquisition, `read(latest=True)` for lag-free display
+- **ROI / subwindow**: configurable resolution for higher frame rates
+- **Calibration blocks**: list and select temperature-range calibration presets
+- **Radiometry**: emissivity, distance, atmospheric temperature, humidity
+- **Temperature sensors**: read all on-board thermistors
+- **NUC**: trigger non-uniformity correction, flag-in-FOV / stow
+- **File I/O**: read FLIR ATS and SFMOV recorded files
 
 ## Installation
 

@@ -146,7 +146,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     """Parse arguments and dispatch to the appropriate sub-command handler."""
     parser = argparse.ArgumentParser(
-        prog="pyflir", description="pyFlir — FLIR thermal camera driver"
+        prog="pyflir", description="pyFlir: FLIR thermal camera driver"
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {_get_version()}")
 

@@ -1,14 +1,14 @@
-"""pyflir.io — File I/O for FLIR thermal recording formats.
+"""pyflir.io: File I/O for FLIR thermal recording formats.
 
 Built-in (no extra dependencies)
 ---------------------------------
-- ATS-US  (.ats)  — FLIR ResearchIR recordings
+- ATS-US  (.ats): FLIR ResearchIR recordings
     read_ats(path)  →  (raw: ndarray, metadata: ATSMetadata)
-    FLIRATSReader   —  full reader class with temperature conversion and export
+    FLIRATSReader: full reader class with temperature conversion and export
 
 Optional (pip install pyflir[io])
 --------------------------------------
-- SFMOV   (.sfmov) — FLIR scientific camera sequence files
+- SFMOV   (.sfmov): FLIR scientific camera sequence files
     read_sfmov(path)       →  raw data array
     read_sfmov_meta(path)  →  metadata dict
 
@@ -516,7 +516,7 @@ class FLIRATSReader:
         """Return temperature array in the requested unit (C, K, or F)."""
         if self.temperature_C is None:
             raise RuntimeError(
-                "No calibration data found in file — cannot convert to temperature."
+                "No calibration data found in file; cannot convert to temperature."
             )
         u = unit.upper()
         if u == "C":
@@ -599,7 +599,7 @@ def read_ats(filepath: str) -> tuple:
     return reader.raw, reader.metadata
 
 
-# ── SFMOV reader (optional — requires pysfmov) ────────────────────────────────
+# ── SFMOV reader (optional; requires pysfmov) ────────────────────────────────
 
 def read_sfmov(filepath: str):
     """Read a FLIR SFMOV sequence file (.sfmov).
