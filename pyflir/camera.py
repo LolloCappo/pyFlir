@@ -204,6 +204,10 @@ class Camera:
             self.ip     = cam_info["ip"]
             self.serial = cam_info.get("serial", "")
             self.model  = cam_info.get("model", "")
+            if not self.interface_ip:
+                # Reuse the NIC that received the discovery reply for
+                # control and streaming.
+                self.interface_ip = cam_info.get("interface_ip", "")
             logger.info(
                 "Found: %s %s  serial=%s  at %s",
                 cam_info.get("manufacturer", ""),
@@ -212,8 +216,20 @@ class Camera:
                 self.ip,
             )
 
-        # Use the connected-socket trick to pick the right local NIC when
-        # interface_ip was not given explicitly — critical for USB dongles.
+        if not self.interface_ip:
+            # Camera given by explicit IP: sweep all interfaces and bind the
+            # one whose discovery reply matches. OS routing can pick the
+            # wrong NIC for link-local cameras on hosts with several
+            # adapters (VPNs, secondary NICs). _local_ip() stays as the
+            # fallback for cameras on routed subnets the sweep cannot see.
+            try:
+                for info in GVCPClient.discover(timeout=self._timeout):
+                    if info.get("ip") == self.ip:
+                        self.interface_ip = info.get("interface_ip") or ""
+                        break
+            except Exception:
+                pass
+
         import time as _time
         local_ip = self._local_ip()
         # pyGigEVision's connect() already polls for ACCESS_DENIED up to 15 s.
