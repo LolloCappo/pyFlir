@@ -29,7 +29,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-from pyGigEVision import GVCPClient, GVCPError, GVSPReceiver
+from pyGigEVision import GVCPClient, GVCPError, GVSPReceiver, fetch_genicam_xml
 from pyGigEVision.standard import (
     REG_SC_HOST_PORT,
     REG_SC_PACKET_SIZE,
@@ -37,7 +37,7 @@ from pyGigEVision.standard import (
     REG_SC_DEST_ADDR,
 )
 
-from .genicam import parse_genicam_xml, RegNode, reg_to_float, float_to_reg, fetch_genicam_xml
+from .genicam import parse_genicam_xml, RegNode
 from . import registers as reg
 
 
