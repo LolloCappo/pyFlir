@@ -28,6 +28,9 @@ Supported cameras:
 pip install pyFlir
 ```
 
+Requires Python 3.10 or later. The [pyGigEVision](https://github.com/ladisk/pyGigEVision)
+transport layer is installed automatically.
+
 ## Quick start
 
 ```python
