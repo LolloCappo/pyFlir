@@ -74,26 +74,6 @@ class CameraError(Exception):
     """Raised for high-level camera operation failures."""
 
 
-def _find_link_local_ip() -> Optional[str]:
-    """Return the local IP of the interface that can reach 169.254.x.x.
-
-    Uses the connected-socket trick rather than hostname resolution, which
-    often resolves to 127.0.1.1 and misses USB-to-GigE dongle adapters on
-    Linux.
-    """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("169.254.0.1", 1))
-        ip = s.getsockname()[0]
-        if ip.startswith("169.254."):
-            return ip
-    except OSError:
-        pass
-    finally:
-        s.close()
-    return None
-
-
 class Camera:
     """FLIR GigE Vision camera controller.
 
