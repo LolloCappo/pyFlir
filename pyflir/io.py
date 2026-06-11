@@ -570,6 +570,9 @@ class FLIRATSReader:
         hi_k = meta.range_counts_max
         if None in (lo_c, hi_c, lo_k, hi_k):
             return None
+        if hi_k == lo_k:
+            # Degenerate calibration block: no count range to map.
+            return None
         slope = (hi_c - lo_c) / (hi_k - lo_k)
         result = self.raw.astype(np.float32)
         result -= lo_k
