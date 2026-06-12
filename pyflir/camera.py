@@ -807,12 +807,18 @@ class Camera:
         }
 
     def get_roi_limits(self) -> dict:
-        """Return ``{width_min, width_inc, height_min, height_inc, sensor_width, sensor_height}``."""
+        """Return ``{width_min, width_inc, height_min, height_inc, sensor_width, sensor_height}``.
+
+        All height values are in usable image rows (metadata rows excluded).
+        """
         self._require_connected()
+        h_min_raw = self._gvcp.read_reg(reg.REG_HEIGHT_MIN)
         return {
             "width_min":     self._gvcp.read_reg(reg.REG_WIDTH_MIN),
             "width_inc":     self._gvcp.read_reg(reg.REG_WIDTH_INC),
-            "height_min":    self._gvcp.read_reg(reg.REG_HEIGHT_MIN),
+            # REG_HEIGHT_MIN counts total rows (image + metadata); subtract so
+            # the returned value represents the minimum usable image rows.
+            "height_min":    max(1, h_min_raw - self._metadata_rows),
             "height_inc":    self._gvcp.read_reg(reg.REG_HEIGHT_INC),
             "sensor_width":  reg.SENSOR_WIDTH,
             "sensor_height": reg.SENSOR_HEIGHT,
@@ -967,7 +973,7 @@ class Camera:
                 return None
 
         out["width"]             = _safe(lambda: self.read_int("Width"))
-        out["height"]            = _safe(lambda: self.read_int("Height"))
+        out["height"]            = _safe(lambda: self.read_int("Height") - self._metadata_rows)
         out["frame_rate_hz"]     = _safe(
             lambda: round(self.read_float("AcquisitionFrameRate"), 2)
         )
