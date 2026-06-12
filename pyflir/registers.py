@@ -16,8 +16,8 @@ REG_CAL_TAG         = 0x4E06240C  # internal tag string, 256 bytes (RO)
 REG_CAL_NAME        = 0x4E06250C  # friendly name string, 256 bytes (RO)
 REG_CAL_LENS        = 0x4E06260C  # lens name string, 256 bytes (RO)
 REG_CAL_LENS_FILTER = 0x4E06270C  # lens filter string, 256 bytes (RO)
-REG_CAL_TMIN        = 0x4E062910  # min temperature of current block (float, °C)
-REG_CAL_TMAX        = 0x4E062918  # max temperature of current block (float, °C)
+REG_CAL_TMIN        = 0x4E062910  # min temperature of current block (float, Kelvin)
+REG_CAL_TMAX        = 0x4E062918  # max temperature of current block (float, Kelvin)
 
 # ============================================================
 # ROI / sensor geometry

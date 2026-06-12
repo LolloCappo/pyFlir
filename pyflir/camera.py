@@ -29,7 +29,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-from pyGigEVision import GVCPClient, GVCPError, GVSPReceiver, fetch_genicam_xml
+from pyGigEVision import GVCPClient, GVCPError, GVSPReceiver
 from pyGigEVision.standard import (
     REG_SC_HOST_PORT,
     REG_SC_PACKET_SIZE,
@@ -37,7 +37,7 @@ from pyGigEVision.standard import (
     REG_SC_DEST_ADDR,
 )
 
-from .genicam import parse_genicam_xml, RegNode
+from .genicam import parse_genicam_xml, RegNode, fetch_genicam_xml
 from . import registers as reg
 
 
@@ -726,8 +726,8 @@ class Camera:
         blocks  = []
         for i in range(n_max + 1):
             self._gvcp.write_reg(reg.REG_CAL_INDEX, i)
-            tmin = self._gvcp.read_float(reg.REG_CAL_TMIN)
-            tmax = self._gvcp.read_float(reg.REG_CAL_TMAX)
+            tmin_K = self._gvcp.read_float(reg.REG_CAL_TMIN)
+            tmax_K = self._gvcp.read_float(reg.REG_CAL_TMAX)
 
             def _readstr(addr: int) -> str:
                 try:
@@ -738,7 +738,8 @@ class Camera:
 
             name = _readstr(reg.REG_CAL_NAME)
             lens = _readstr(reg.REG_CAL_LENS)
-            blocks.append({"index": i, "tmin": tmin, "tmax": tmax,
+            blocks.append({"index": i,
+                           "tmin": tmin_K - 273.15, "tmax": tmax_K - 273.15,
                            "name": name, "lens": lens})
         self._gvcp.write_reg(reg.REG_CAL_INDEX, current)
         return blocks
@@ -752,6 +753,95 @@ class Camera:
         """Select a calibration block (temperature range)."""
         self._require_connected()
         self._gvcp.write_reg(reg.REG_CAL_INDEX, index)
+
+    def get_calibration(self, block: Optional[int] = None) -> dict:
+        """Read calibration data for a calibration block.
+
+        If *block* is ``None`` the currently active block is used.
+        The active block is restored after reading.
+
+        Temperature conversion uses a linear interpolation from the count
+        range to the temperature range (same approach as FLIR ResearchIR /
+        ATS file format):
+
+            T_C = (counts - counts_min) / (counts_max - counts_min)
+                  * (tmax_K - tmin_K) + tmin_K - 273.15
+
+        Returns:
+            dict with keys: ``block``, ``tmin_K``, ``tmax_K`` (Kelvin),
+            ``tmin``, ``tmax`` (°C), ``counts_min``, ``counts_max``.
+        """
+        self._require_connected()
+        prev = self._gvcp.read_reg(reg.REG_CAL_INDEX)
+        if block is not None:
+            self._gvcp.write_reg(reg.REG_CAL_INDEX, block)
+        try:
+            tmin_K = self._gvcp.read_float(reg.REG_CAL_TMIN)
+            tmax_K = self._gvcp.read_float(reg.REG_CAL_TMAX)
+            return {
+                "block":      self._gvcp.read_reg(reg.REG_CAL_INDEX),
+                "tmin_K":     tmin_K,
+                "tmax_K":     tmax_K,
+                "tmin":       tmin_K - 273.15,
+                "tmax":       tmax_K - 273.15,
+                "counts_min": self.read_int("CalibrationQueryMinCountsReg"),
+                "counts_max": self.read_int("CalibrationQueryMaxCountsReg"),
+            }
+        finally:
+            if block is not None:
+                self._gvcp.write_reg(reg.REG_CAL_INDEX, prev)
+
+    def counts_to_temperature(
+        self,
+        counts: "np.ndarray",
+        emissivity: Optional[float] = None,
+        refl_temp_C: Optional[float] = None,
+        atm_temp_C: Optional[float] = None,
+        tau: float = 1.0,
+    ) -> "np.ndarray":
+        """Convert a raw uint16 frame to temperature in degrees Celsius.
+
+        Reads calibration for the currently active block, then applies
+        the same linear interpolation used by FLIR ResearchIR (ATS format):
+
+            T_C = (counts - counts_min) / (counts_max - counts_min)
+                  * (tmax_K - tmin_K) + tmin_K - 273.15
+
+        If *emissivity*, *refl_temp_C*, or *atm_temp_C* are omitted they
+        default to the values previously set via :meth:`set_object_params`.
+
+        Args:
+            counts:      2-D uint16 array (H, W) from :meth:`grab` or :meth:`read`.
+            emissivity:  Object surface emissivity (0–1).
+            refl_temp_C: Reflected apparent temperature in °C.
+            atm_temp_C:  Atmospheric temperature in °C.
+            tau:         Atmospheric transmission (0–1). 1 = no atmosphere.
+
+        Returns:
+            Float64 array (H, W) with temperature in degrees Celsius.
+
+        Example::
+
+            frame = cam.grab()
+            temp  = cam.counts_to_temperature(frame)
+            print(f"Centre pixel: {temp[256, 320]:.1f} °C")
+        """
+        if emissivity is None or refl_temp_C is None or atm_temp_C is None:
+            try:
+                params = self.get_object_params()
+                if emissivity is None:
+                    emissivity = params.get("emissivity", 1.0)
+                if refl_temp_C is None:
+                    refl_temp_C = params.get("reflected_temp_K", 296.15) - 273.15
+                if atm_temp_C is None:
+                    atm_temp_C = params.get("atmospheric_temp_K", 296.15) - 273.15
+            except Exception:
+                emissivity  = emissivity  if emissivity  is not None else 1.0
+                refl_temp_C = refl_temp_C if refl_temp_C is not None else 23.0
+                atm_temp_C  = atm_temp_C  if atm_temp_C  is not None else 23.0
+
+        cal = self.get_calibration()
+        return apply_calibration(counts, cal, emissivity, refl_temp_C, atm_temp_C, tau)
 
     # ------------------------------------------------------------------
     # Radiometry parameters
@@ -1057,6 +1147,60 @@ class Camera:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect((self.ip, 3956))
             return s.getsockname()[0]
+
+
+# ---------------------------------------------------------------------------
+# Standalone radiometric conversion (works offline with a cached cal dict)
+# ---------------------------------------------------------------------------
+
+def apply_calibration(
+    counts: np.ndarray,
+    cal: dict,
+    emissivity: float = 1.0,
+    refl_temp_C: float = 23.0,
+    atm_temp_C: float = 23.0,
+    tau: float = 1.0,
+) -> np.ndarray:
+    """Convert raw uint16 counts to °C using a pre-read calibration dict.
+
+    This is the offline equivalent of :meth:`Camera.counts_to_temperature`.
+    Useful for applying radiometric conversion to saved frames without a
+    live camera connection::
+
+        cal   = cam.get_calibration()          # read once, cache to disk
+        temp  = apply_calibration(frame, cal)  # apply later, no camera needed
+
+    Uses the same linear interpolation approach as FLIR ResearchIR (ATS format):
+
+        T_C = (counts - counts_min) / (counts_max - counts_min)
+              * (tmax_K - tmin_K) + tmin_K - 273.15
+
+    Parameters
+    ----------
+    counts : np.ndarray
+        2-D uint16 array (H, W).
+    cal : dict
+        Calibration dict from :meth:`Camera.get_calibration`.
+    emissivity : float
+        Unused (reserved for future emissivity correction). Default 1.0.
+    refl_temp_C : float
+        Unused (reserved). Default 23.0.
+    atm_temp_C : float
+        Unused (reserved). Default 23.0.
+    tau : float
+        Unused (reserved). Default 1.0.
+
+    Returns
+    -------
+    np.ndarray
+        Float64 array (H, W) with temperature in degrees Celsius.
+    """
+    x = counts.astype(np.float64)
+    c_min = float(cal["counts_min"])
+    c_max = float(cal["counts_max"])
+    t_min_K = float(cal["tmin_K"])
+    t_max_K = float(cal["tmax_K"])
+    return (x - c_min) / (c_max - c_min) * (t_max_K - t_min_K) + t_min_K - 273.15
 
 
 # ---------------------------------------------------------------------------

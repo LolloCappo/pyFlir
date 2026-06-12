@@ -1,7 +1,6 @@
-"""GenICam XML parser for FLIR cameras.
+"""GenICam XML parser and downloader for FLIR cameras.
 
-Extracts register addresses and metadata from a camera's GenICam XML,
-downloaded via pyGigEVision.fetch_genicam_xml().
+Extracts register addresses and metadata from a camera's GenICam XML.
 
 Supports the most common node types with direct <Address> tags:
   Integer, IntReg, Float, FloatReg, Enumeration, Command, Boolean,
@@ -10,10 +9,15 @@ Supports the most common node types with direct <Address> tags:
 Nodes whose address is computed via <pAddress> or IntSwissKnife are
 skipped; these are a small minority in typical FLIR XMLs.
 """
+import io
 import struct
+import zipfile
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+
+# Bootstrap register address for FIRST_URL (GigE Vision spec §16.3)
+_REG_FIRST_URL = 0x00000200
 
 
 @dataclass
@@ -118,6 +122,56 @@ def parse_genicam_xml(xml_bytes: bytes) -> Dict[str, RegNode]:
             nodes[name] = node
 
     return nodes
+
+
+# ---------------------------------------------------------------------------
+# FLIR-aware GenICam XML downloader
+# ---------------------------------------------------------------------------
+
+def _parse_url_int(s: str, flir_bare_hex: bool = False) -> int:
+    """Parse one numeric field from a GigE Vision FIRST_URL.
+
+    Standard cameras use '0x'-prefixed hex or plain decimal.
+    FLIR cameras omit the '0x' prefix on both address and size fields.
+    The address field always contains a–f chars so it's easy to detect.
+    The size field can look like a decimal number (e.g. '15255') but is
+    also bare hex when the address is bare hex — hence the shared flag.
+    """
+    s = s.strip()
+    if flir_bare_hex or any(c in s.lower() for c in "abcdef"):
+        return int(s, 16)
+    return int(s, 0)
+
+
+def fetch_genicam_xml(gvcp_client) -> tuple:
+    """Download and return (xml_bytes, filename) from the camera.
+
+    Works around a FLIR-specific FIRST_URL encoding quirk: both the
+    address and size fields are bare hex without a '0x' prefix.  The
+    size field often contains only decimal digits (e.g. '15255') so
+    standard parsers silently misread it as decimal (15 255) instead of
+    hex (86 613), truncating the download and producing a bad ZIP.
+    """
+    url_bytes = gvcp_client.read_mem(_REG_FIRST_URL, 512)
+    url = url_bytes.split(b"\x00", 1)[0].decode("ascii", errors="replace")
+    parts = url.split(";")
+    if len(parts) < 3:
+        raise ValueError(f"Malformed FIRST_URL: {url!r}")
+    filename = parts[0].split(":")[-1]
+    # If the address field has a–f chars it is FLIR-style bare hex;
+    # treat the size field as bare hex too (same URL, same convention).
+    flir_hex = any(c in parts[1].lower() for c in "abcdef")
+    addr = _parse_url_int(parts[1], flir_bare_hex=flir_hex)
+    size = _parse_url_int(parts[2], flir_bare_hex=flir_hex)
+
+    data = gvcp_client.read_mem(addr, size)
+
+    if filename.lower().endswith(".zip"):
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            xml_name = next(n for n in zf.namelist() if n.lower().endswith(".xml"))
+            return zf.read(xml_name), xml_name
+
+    return data, filename
 
 
 # ---------------------------------------------------------------------------

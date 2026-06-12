@@ -25,7 +25,7 @@ __version__ = "0.2.0"
 
 from pyGigEVision import GVCPClient, GVCPError, GVSPReceiver
 
-from .camera import Camera, CameraError, discover
+from .camera import Camera, CameraError, discover, apply_calibration
 from .connection import ConnectionReport, tune_connection
 from .errors import ConnectionStats
 from .genicam import RegNode, parse_genicam_xml
@@ -39,6 +39,7 @@ __all__ = [
     "CameraError",
     "discover",
     "force_ip",
+    "apply_calibration",
     # GenICam XML
     "parse_genicam_xml",
     "RegNode",
