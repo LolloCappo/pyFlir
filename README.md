@@ -1,5 +1,21 @@
 ![pyFlir](pyflir_logo.png)
 
+
+.. image:: https://github.com/ladisk/pyTelops/actions/workflows/testing.yml/badge.svg
+   :target: https://github.com/ladisk/pyTelops/actions/workflows/testing.yml
+   :alt: Tests
+
+.. image:: https://readthedocs.org/projects/pytelops/badge/?version=latest
+   :target: https://pytelops.readthedocs.io/en/latest/
+   :alt: Documentation
+
+.. image:: https://img.shields.io/pypi/v/pyTelops.svg
+   :target: https://pypi.org/project/pyTelops/
+
+.. image:: https://img.shields.io/pypi/l/pyTelops.svg
+   :target: https://github.com/ladisk/pyTelops/blob/master/LICENSE
+
+
 Pure-Python driver for FLIR® thermal cameras over GigE Vision. No vendor SDK
 required; communicates directly via GVCP/GVSP protocols over UDP using
 [pyGigEVision](https://github.com/ladisk/pyGigEVision) as the transport layer.
