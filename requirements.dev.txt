@@ -1,8 +1,12 @@
 -r requirements.txt
+sphinx
+sphinx-book-theme
+sphinx-copybutton>=0.5.2
+sphinx-llms-txt
+sphinx-markdown-builder
 pytest
 pytest-cov
 build
 twine
+wheel
 ruff
-matplotlib
-Pillow

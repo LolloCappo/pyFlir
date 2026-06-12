@@ -1,3 +1,3 @@
 numpy>=1.20
-psutil
-pyGigEVision
+psutil>=5.9
+pyGigEVision>=0.2.1

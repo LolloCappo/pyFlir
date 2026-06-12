@@ -5,30 +5,89 @@ build-backend = "hatchling.build"
 [project]
 name = "pyFlir"
 version = "0.2.0"
-description = "Python library for FLIR cameras reading based on GigE protocol"
-readme = "README.md"
-requires-python = ">=3.8"
-license = { text = "MIT" }
-authors = [{ name = "Lorenzo Capponi", email = "lorenzocapponi@outlook.it" }]
-keywords = ["flir", "gige", "camera", "thermal", "infrared", "genicam"]
+description = "Pure-Python driver for FLIR thermal cameras over GigE Vision"
+readme = "PYPI_README.rst"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Lorenzo Capponi", email = "lorenzocapponi@outlook.it" },
+]
+keywords = ["flir", "thermal", "camera", "gige", "genicam", "infrared", "MWIR"]
 classifiers = [
-    "Programming Language :: Python :: 3",
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
     "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: System :: Hardware :: Hardware Drivers",
 ]
 dependencies = [
-    "pyGigEVision",
-    "numpy",
-    "psutil",
+    "pyGigEVision>=0.2.1",
+    "numpy>=1.20",
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
-gui = [
-    "matplotlib",
-    "Pillow",
+dev = [
+    "sphinx",
+    "sphinx-book-theme",
+    "sphinx-copybutton>=0.5.2",
+    "sphinx-llms-txt",
+    "sphinx-markdown-builder",
+    "pytest",
+    "pytest-cov",
+    "build",
+    "twine",
+    "wheel",
+    "ruff",
 ]
 
 [project.scripts]
 pyflir = "pyflir.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/LolloCappo/pyFlir"
+Documentation = "https://pyflir.readthedocs.io"
+Repository = "https://github.com/LolloCappo/pyFlir"
+Issues = "https://github.com/LolloCappo/pyFlir/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "hardware: requires a connected FLIR camera",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "SIM"]
+ignore = ["E501", "N999"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "pyflir/",
+    "tests/",
+    "docs/",
+    "examples/",
+    "README.md",
+    "PYPI_README.rst",
+    "LICENSE",
+    "pyproject.toml",
+    "requirements.txt",
+    "requirements.dev.txt",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["pyflir"]
