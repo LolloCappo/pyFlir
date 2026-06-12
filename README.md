@@ -1,6 +1,6 @@
 ![pyFlir](pyflir_logo.png)
 
-## pyFlir
+# pyFlir
 
 Pure-Python driver for FLIR® thermal cameras over GigE Vision. No vendor SDK
 required; communicates directly via GVCP/GVSP protocols over UDP using
