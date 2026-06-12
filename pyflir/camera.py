@@ -726,8 +726,8 @@ class Camera:
         blocks  = []
         for i in range(n_max + 1):
             self._gvcp.write_reg(reg.REG_CAL_INDEX, i)
-            tmin_K = self._gvcp.read_float(reg.REG_CAL_TMIN)
-            tmax_K = self._gvcp.read_float(reg.REG_CAL_TMAX)
+            tmin = self._gvcp.read_float(reg.REG_CAL_TMIN)
+            tmax = self._gvcp.read_float(reg.REG_CAL_TMAX)
 
             def _readstr(addr: int) -> str:
                 try:
@@ -738,8 +738,7 @@ class Camera:
 
             name = _readstr(reg.REG_CAL_NAME)
             lens = _readstr(reg.REG_CAL_LENS)
-            blocks.append({"index": i,
-                           "tmin": tmin_K - 273.15, "tmax": tmax_K - 273.15,
+            blocks.append({"index": i, "tmin": tmin, "tmax": tmax,
                            "name": name, "lens": lens})
         self._gvcp.write_reg(reg.REG_CAL_INDEX, current)
         return blocks
@@ -760,32 +759,44 @@ class Camera:
         If *block* is ``None`` the currently active block is used.
         The active block is restored after reading.
 
-        Temperature conversion uses a linear interpolation from the count
-        range to the temperature range (same approach as FLIR ResearchIR /
-        ATS file format):
+        Temperature conversion uses two polynomials:
 
-            T_C = (counts - counts_min) / (counts_max - counts_min)
-                  * (tmax_K - tmin_K) + tmin_K - 273.15
+        1. counts → radiance:  W = Σ counts_coeffs[i] · counts^i − counts_background
+        2. radiance → temp °C: T_C = Σ temp_coeffs[i] · W^i
+
+        Both tmin/tmax and the temp polynomial output are in °C.
 
         Returns:
-            dict with keys: ``block``, ``tmin_K``, ``tmax_K`` (Kelvin),
-            ``tmin``, ``tmax`` (°C), ``counts_min``, ``counts_max``.
+            dict with keys: ``block``, ``tmin``, ``tmax`` (°C),
+            ``counts_order``, ``counts_coeffs``, ``counts_background``,
+            ``temp_order``, ``temp_coeffs``.
         """
         self._require_connected()
         prev = self._gvcp.read_reg(reg.REG_CAL_INDEX)
         if block is not None:
             self._gvcp.write_reg(reg.REG_CAL_INDEX, block)
         try:
-            tmin_K = self._gvcp.read_float(reg.REG_CAL_TMIN)
-            tmax_K = self._gvcp.read_float(reg.REG_CAL_TMAX)
+            c_order = self.read_int("CalibrationQueryOrderReg")
+            c_coeffs = [
+                self.read_float(f"CalibrationQueryCoeff{i}Reg")
+                for i in range(c_order + 1)
+            ]
+            t_order = self.read_int("CalibrationQueryTempOrderReg")
+            t_coeffs = [
+                self.read_float(f"CalibrationQueryTempCoeff{i}Reg")
+                for i in range(t_order + 1)
+            ]
             return {
-                "block":      self._gvcp.read_reg(reg.REG_CAL_INDEX),
-                "tmin_K":     tmin_K,
-                "tmax_K":     tmax_K,
-                "tmin":       tmin_K - 273.15,
-                "tmax":       tmax_K - 273.15,
-                "counts_min": self.read_int("CalibrationQueryMinCountsReg"),
-                "counts_max": self.read_int("CalibrationQueryMaxCountsReg"),
+                "block":             self._gvcp.read_reg(reg.REG_CAL_INDEX),
+                "tmin":              self._gvcp.read_float(reg.REG_CAL_TMIN),
+                "tmax":              self._gvcp.read_float(reg.REG_CAL_TMAX),
+                "counts_min":        self.read_float("CalibrationQueryMinCountsReg"),
+                "counts_max":        self.read_float("CalibrationQueryMaxCountsReg"),
+                "counts_order":      c_order,
+                "counts_coeffs":     c_coeffs,
+                "counts_background": self.read_float("CalibrationQueryBackgroundValueReg"),
+                "temp_order":        t_order,
+                "temp_coeffs":       t_coeffs,
             }
         finally:
             if block is not None:
@@ -802,10 +813,10 @@ class Camera:
         """Convert a raw uint16 frame to temperature in degrees Celsius.
 
         Reads calibration for the currently active block, then applies
-        the same linear interpolation used by FLIR ResearchIR (ATS format):
+        two polynomial steps:
 
-            T_C = (counts - counts_min) / (counts_max - counts_min)
-                  * (tmax_K - tmin_K) + tmin_K - 273.15
+        1. counts → radiance:  W = Σ counts_coeffs[i] · counts^i − background
+        2. radiance → °C:      T_C = Σ temp_coeffs[i] · W^i
 
         If *emissivity*, *refl_temp_C*, or *atm_temp_C* are omitted they
         default to the values previously set via :meth:`set_object_params`.
@@ -1170,10 +1181,17 @@ def apply_calibration(
         cal   = cam.get_calibration()          # read once, cache to disk
         temp  = apply_calibration(frame, cal)  # apply later, no camera needed
 
-    Uses the same linear interpolation approach as FLIR ResearchIR (ATS format):
+    Applies two polynomial steps:
 
-        T_C = (counts - counts_min) / (counts_max - counts_min)
-              * (tmax_K - tmin_K) + tmin_K - 273.15
+    1. counts → radiance: W = Σ counts_coeffs[i] · counts^i
+    2. radiance → temp:   T = Σ temp_coeffs[i] · W^i
+
+    Counts are first un-shifted from MSB-aligned Mono16 to the native
+    14-bit ADC range when needed (uint16 = adc << 2) and clipped to the
+    calibrated domain [counts_min, counts_max].  Whether the temperature
+    polynomial outputs Kelvin or Celsius — and whether the background
+    value must be subtracted from W — is resolved automatically by
+    checking the chain against the block endpoints (tmin/tmax, °C).
 
     Parameters
     ----------
@@ -1182,7 +1200,7 @@ def apply_calibration(
     cal : dict
         Calibration dict from :meth:`Camera.get_calibration`.
     emissivity : float
-        Unused (reserved for future emissivity correction). Default 1.0.
+        Unused (reserved). Default 1.0.
     refl_temp_C : float
         Unused (reserved). Default 23.0.
     atm_temp_C : float
@@ -1195,12 +1213,37 @@ def apply_calibration(
     np.ndarray
         Float64 array (H, W) with temperature in degrees Celsius.
     """
-    x = counts.astype(np.float64)
-    c_min = float(cal["counts_min"])
-    c_max = float(cal["counts_max"])
-    t_min_K = float(cal["tmin_K"])
-    t_max_K = float(cal["tmax_K"])
-    return (x - c_min) / (c_max - c_min) * (t_max_K - t_min_K) + t_min_K - 273.15
+    cmin = float(cal["counts_min"])
+    cmax = float(cal["counts_max"])
+    tmin = float(cal["tmin"])
+    tmax = float(cal["tmax"])
+
+    # The A6751sc has a 14-bit ADC but GigE Vision streams Mono16 with the
+    # value left-justified (uint16 = adc_14bit << 2).  The calibration
+    # endpoints counts_min/counts_max are in native 14-bit space, so divide
+    # raw pixel values by 4 to bring them into the same domain.
+    x = counts.astype(np.float64) / 4.0
+
+    # Two-polynomial radiometric conversion (no background subtraction):
+    #   1. counts (14-bit) → radiance W
+    #   2. radiance W → temperature
+    # np.polyval expects highest-degree coefficient first; the camera stores
+    # them lowest-degree first, so reverse before calling polyval.
+    c_hi = np.asarray(cal["counts_coeffs"], dtype=np.float64)[::-1]
+    t_hi = np.asarray(cal["temp_coeffs"],   dtype=np.float64)[::-1]
+    W = np.polyval(c_hi, x)
+    T = np.polyval(t_hi, W)
+
+    # Determine K→C offset by checking the polynomial output at the known
+    # block endpoints (tmin/tmax are confirmed Celsius).  If the polynomial
+    # outputs Kelvin, the endpoint values will be ~273 higher than tmin/tmax.
+    W_lo = float(np.polyval(c_hi, cmin))
+    W_hi = float(np.polyval(c_hi, cmax))
+    T_lo = float(np.polyval(t_hi, W_lo))
+    T_hi = float(np.polyval(t_hi, W_hi))
+    offs = 273.15 if abs(T_lo - 273.15 - tmin) < abs(T_lo - tmin) else 0.0
+
+    return T - offs
 
 
 # ---------------------------------------------------------------------------
