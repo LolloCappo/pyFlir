@@ -29,7 +29,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-from pyGigEVision import GVCPClient, GVCPError, GVSPReceiver
+from pyGigEVision import GVCPClient, GVCPError, GVSPReceiver, fetch_genicam_xml
 from pyGigEVision.standard import (
     REG_SC_HOST_PORT,
     REG_SC_PACKET_SIZE,
@@ -37,7 +37,7 @@ from pyGigEVision.standard import (
     REG_SC_DEST_ADDR,
 )
 
-from .genicam import parse_genicam_xml, RegNode, reg_to_float, float_to_reg, fetch_genicam_xml
+from .genicam import parse_genicam_xml, RegNode
 from . import registers as reg
 
 
@@ -72,70 +72,6 @@ _SFNC_CANDIDATES = {
 
 class CameraError(Exception):
     """Raised for high-level camera operation failures."""
-
-
-def _find_link_local_ip() -> Optional[str]:
-    """Return the local IP of the interface that can reach 169.254.x.x.
-
-    Uses the connected-socket trick rather than hostname resolution, which
-    often resolves to 127.0.1.1 and misses USB-to-GigE dongle adapters on
-    Linux.
-    """
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("169.254.0.1", 1))
-        ip = s.getsockname()[0]
-        if ip.startswith("169.254."):
-            return ip
-    except OSError:
-        pass
-    finally:
-        s.close()
-    return None
-
-
-def _local_interface_ips() -> list:
-    """Return all non-loopback IPv4 addresses on this host.
-
-    Used to broadcast discovery on every interface so cameras on secondary
-    NICs (e.g. USB-to-GigE dongles) are not missed.
-    """
-    try:
-        import psutil
-        ips = []
-        for addrs in psutil.net_if_addrs().values():
-            for a in addrs:
-                if a.family == socket.AF_INET and not a.address.startswith("127."):
-                    ips.append(a.address)
-        return ips
-    except Exception:
-        return []
-
-
-def _discover_all(timeout: float = 3.0) -> list:
-    """Broadcast discovery on every local interface and merge the results.
-
-    On Linux a socket that is not bound to a specific interface sends its
-    broadcast only via the default route, so cameras reachable via a
-    USB-to-GigE dongle are silently missed.  This function iterates every
-    local IPv4 address and fires a separate discovery broadcast from each,
-    then deduplicates by camera IP.
-    """
-    candidates = _local_interface_ips()
-    if not candidates:
-        # psutil unavailable — fall back to OS-default broadcast
-        return GVCPClient.discover(interface_ip="", timeout=timeout)
-
-    per_iface = max(2.0, timeout / len(candidates))
-    seen: dict = {}
-    for iface_ip in candidates:
-        try:
-            for cam in GVCPClient.discover(interface_ip=iface_ip, timeout=per_iface):
-                if cam["ip"] not in seen:
-                    seen[cam["ip"]] = cam
-        except Exception:
-            pass
-    return list(seen.values())
 
 
 class Camera:
@@ -245,15 +181,16 @@ class Camera:
             return
 
         if not self.ip:
-            if self.interface_ip:
-                # Caller specified an interface — use it directly.
-                logger.debug("Discovering cameras on interface %s…", self.interface_ip)
-                found = GVCPClient.discover(interface_ip=self.interface_ip, timeout=3.0)
-            else:
-                # Broadcast on every local interface so cameras reachable via
-                # USB-to-GigE dongles are not missed (Linux default-route issue).
-                logger.debug("Discovering cameras on all interfaces…")
-                found = _discover_all(timeout=3.0)
+            # With an empty interface_ip pyGigEVision broadcasts on every
+            # local interface, so cameras reachable via USB-to-GigE dongles
+            # are not missed (Linux default-route issue).
+            logger.debug(
+                "Discovering cameras on %s…",
+                self.interface_ip or "all interfaces",
+            )
+            found = GVCPClient.discover(
+                interface_ip=self.interface_ip, timeout=3.0
+            )
             if not found:
                 raise CameraError(
                     "No GigE Vision cameras found. Check:\n"
@@ -267,6 +204,10 @@ class Camera:
             self.ip     = cam_info["ip"]
             self.serial = cam_info.get("serial", "")
             self.model  = cam_info.get("model", "")
+            if not self.interface_ip:
+                # Reuse the NIC that received the discovery reply for
+                # control and streaming.
+                self.interface_ip = cam_info.get("interface_ip", "")
             logger.info(
                 "Found: %s %s  serial=%s  at %s",
                 cam_info.get("manufacturer", ""),
@@ -275,8 +216,20 @@ class Camera:
                 self.ip,
             )
 
-        # Use the connected-socket trick to pick the right local NIC when
-        # interface_ip was not given explicitly — critical for USB dongles.
+        if not self.interface_ip:
+            # Camera given by explicit IP: sweep all interfaces and bind the
+            # one whose discovery reply matches. OS routing can pick the
+            # wrong NIC for link-local cameras on hosts with several
+            # adapters (VPNs, secondary NICs). _local_ip() stays as the
+            # fallback for cameras on routed subnets the sweep cannot see.
+            try:
+                for info in GVCPClient.discover(timeout=self._timeout):
+                    if info.get("ip") == self.ip:
+                        self.interface_ip = info.get("interface_ip") or ""
+                        break
+            except Exception:
+                pass
+
         import time as _time
         local_ip = self._local_ip()
         # pyGigEVision's connect() already polls for ACCESS_DENIED up to 15 s.
@@ -294,7 +247,7 @@ class Camera:
                 if _time.monotonic() >= _deadline:
                     raise CameraError(
                         f"Could not take control of camera at {self.ip}: {exc}\n"
-                        "Another client may hold exclusive access — close FLIR software "
+                        "Another client may hold exclusive access; close FLIR software "
                         f"or wait for the heartbeat to expire (waited {_total_wait:.0f}s)."
                     ) from exc
                 attempt += 1
@@ -425,7 +378,7 @@ class Camera:
         for attr, candidates in (
             # FLIR-specific registers hold the product name (e.g. "A6751sc");
             # DeviceModelName is the platform / firmware family name ("Xsc Series").
-            # Always overwrite — GVCP discovery values are less specific than XML registers.
+            # Always overwrite; GVCP discovery values are less specific than XML registers.
             ("model",  ["CameraModel", "MfgDeviceModelName", "DeviceModelName"]),
             ("serial", ["CameraSerial", "DeviceSerialNumber", "DeviceID"]),
         ):
@@ -466,7 +419,7 @@ class Camera:
             return
 
         if self.width is None or self.height is None:
-            raise CameraError("Image dimensions unknown — call load_xml() first.")
+            raise CameraError("Image dimensions unknown; call load_xml() first.")
 
         local_ip = self._local_ip()
 
@@ -555,7 +508,7 @@ class Camera:
             CameraError: If not streaming or no frame arrives in time.
         """
         if not self._streaming or self._gvsp is None:
-            raise CameraError("Not streaming — call start_stream() first.")
+            raise CameraError("Not streaming; call start_stream() first.")
 
         if latest:
             frame = None
@@ -942,7 +895,7 @@ class Camera:
         """Apply the stored NUC correction coefficients for the given preset.
 
         Loads pre-computed correction data (PS0–PS3) into the active pipeline.
-        Does not compute a new NUC — to do that, move the physical flag into
+        Does not compute a new NUC; to do that, move the physical flag into
         the FOV, capture a flat-field frame, then save and re-apply.
 
         Args:
@@ -1081,11 +1034,11 @@ class Camera:
 
     def _require_connected(self) -> None:
         if self._gvcp is None:
-            raise CameraError("Not connected — call connect() first.")
+            raise CameraError("Not connected; call connect() first.")
 
     def _get_node(self, feature: str) -> RegNode:
         if not self._nodes:
-            raise CameraError("Register map not loaded — call load_xml() first.")
+            raise CameraError("Register map not loaded; call load_xml() first.")
         resolved = self._aliases.get(feature, feature)
         if resolved not in self._nodes:
             raise KeyError(f"Feature '{feature}' not found in register map.")
@@ -1116,8 +1069,9 @@ def discover(
         timeout: Seconds to wait for discovery replies.
 
     Returns:
-        List of dicts with keys: ip, manufacturer, model,
-        device_version, serial, user_name.
+        List of dicts with keys: ip, mac, spec_version, manufacturer,
+        model, device_version, manufacturer_info, serial, user_name,
+        interface_ip (the local NIC that received the reply).
 
     Example::
 
@@ -1126,6 +1080,4 @@ def discover(
         for cam in cameras:
             print(cam["manufacturer"], cam["model"], cam["ip"])
     """
-    if interface_ip:
-        return GVCPClient.discover(interface_ip=interface_ip, timeout=timeout)
-    return _discover_all(timeout=timeout)
+    return GVCPClient.discover(interface_ip=interface_ip or "", timeout=timeout)

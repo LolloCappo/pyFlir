@@ -30,7 +30,7 @@ REG_HEIGHT_MIN = 0x4E058018  # minimum ROI height (RO)
 REG_HEIGHT_INC = 0x4E05801C  # height increment step (RO)
 
 # ============================================================
-# NUC (Non-Uniformity Correction) — one register per preset (PS0–PS3)
+# NUC (Non-Uniformity Correction): one register per preset (PS0–PS3)
 # Write 1 to apply the stored NUC coefficients for that preset.
 # ============================================================
 REG_NUC_LOAD = {
@@ -50,7 +50,7 @@ REG_FLAG_IN_FOV = 0x4E05C418  # move flag into FOV (write 1)
 # On-board temperature sensors
 # ============================================================
 REG_TEMP_SELECTOR = 0x4E05B418  # selects which sensor to read (RW)
-REG_TEMP_VALUE    = 0x4E05B41C  # temperature in °C — float (RO)
+REG_TEMP_VALUE    = 0x4E05B41C  # temperature in °C (float, RO)
 
 TEMP_SENSORS = {
     "FPA":        0,

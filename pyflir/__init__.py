@@ -1,4 +1,4 @@
-"""pyFlir — Pure-Python driver for FLIR thermal cameras over GigE Vision.
+"""pyFlir: Pure-Python driver for FLIR thermal cameras over GigE Vision.
 
 Built on pyGigEVision for the transport layer (GVCP control + GVSP streaming).
 Vendor-specific registers and calibration are handled by this package.

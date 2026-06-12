@@ -78,11 +78,9 @@ def tune_connection(
     if read_nic_info:
         _read_nic_info(cam, probe, warnings)
 
-    recommended: dict = {}
-    if probe.max_packet_size is not None and probe.max_packet_size > 1500:
-        recommended["packet_size"] = probe.max_packet_size
-    else:
-        recommended["packet_size"] = 1500
+    # MTU-safe default for 1 GbE without jumbo frames. A live jumbo-frame
+    # probe could raise this; nothing populates probe.max_packet_size today.
+    recommended: dict = {"packet_size": 1500}
 
     return ConnectionReport(recommended=recommended, probe=probe, warnings=warnings)
 
