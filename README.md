@@ -2,6 +2,12 @@
 
 # pyFlir
 
+[![Tests](https://github.com/LolloCappo/pyFlir/actions/workflows/testing.yml/badge.svg)](https://github.com/LolloCappo/pyFlir/actions/workflows/testing.yml)
+[![PyPI](https://img.shields.io/pypi/v/pyFlir.svg)](https://pypi.org/project/pyFlir/)
+[![Python](https://img.shields.io/pypi/pyversions/pyFlir.svg)](https://pypi.org/project/pyFlir/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Docs](https://readthedocs.org/projects/pyflir/badge/?version=latest)](https://pyflir.readthedocs.io/en/latest/)
+
 Pure-Python driver for FLIR® thermal cameras over GigE Vision. No vendor SDK
 required; communicates directly via GVCP/GVSP protocols over UDP using
 [pyGigEVision](https://github.com/ladisk/pyGigEVision) as the transport layer.
