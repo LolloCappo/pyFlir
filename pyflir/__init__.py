@@ -22,7 +22,6 @@ Quick start::
 """
 
 __version__ = "0.2.0"
-
 from pyGigEVision import GVCPClient, GVCPError, GVSPReceiver
 
 from . import io

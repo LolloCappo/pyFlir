@@ -7,7 +7,6 @@ project = "pyFlir"
 author = "Lorenzo Capponi"
 copyright = "2026, Lorenzo Capponi"
 release = "0.2.0"
-
 extensions = [
     "sphinx.ext.autodoc",
     "sphinx.ext.napoleon",
