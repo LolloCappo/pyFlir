@@ -18,15 +18,8 @@ _USB_ADAPTER_KEYS = ("usb", "ax88", "asix", "rtl8153", "rtl8156", "hub")
 class ConnectionReport:
     """Result of :func:`tune_connection`.
 
-    Attributes
-    ----------
-    recommended : dict
-        Suggested ``packet_size`` and any other kwargs to pass to
-        :meth:`Camera.start_stream`.
-    probe : ConnectionStats or None
-        Read-only facts gathered from the host NIC (speed, USB, MTU).
-    warnings : list of str
-        Human-readable warnings about the network environment.
+    Fields are documented below; pass the report to :meth:`apply` to
+    write the recommended settings onto a connected camera.
     """
 
     recommended: dict

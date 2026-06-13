@@ -32,6 +32,14 @@ from .genicam import RegNode, parse_genicam_xml
 from .io import ATSMetadata, FLIRATSReader, read_ats, read_sfmov, read_sfmov_meta
 from .provisioning import force_ip
 
+# Tell Sphinx these classes live in the top-level `pyflir` namespace so they
+# are not treated as aliased imports and do not generate duplicate doc entries.
+ConnectionReport.__module__ = __name__
+ConnectionStats.__module__ = __name__
+ATSMetadata.__module__ = __name__
+FLIRATSReader.__module__ = __name__
+RegNode.__module__ = __name__
+
 __all__ = [
     # Camera driver
     "Camera",

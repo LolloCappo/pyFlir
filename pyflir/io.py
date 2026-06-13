@@ -56,54 +56,9 @@ _RESOLUTIONS = [
 class ATSMetadata:
     """All metadata extracted from a FLIR ATS-US file.
 
-    Attributes
-    ----------
-    filepath : str
-        Absolute path to the source file.
-    file_size_bytes : int
-        File size in bytes.
-
-    Camera
-    ------
-    camera_model : str or None
-    camera_part  : str or None
-    lens         : str or None
-    filter       : str or None
-
-    Acquisition
-    -----------
-    width, height : int
-        Image dimensions in pixels.
-    n_frames : int
-        Number of frames loaded.
-    frame_start_byte : int
-        Byte offset of the first frame block in the file.
-    stride_bytes : int
-        Bytes between consecutive frame block starts.
-    sync_row_bytes : int
-        Bytes skipped at the start of each block (sync header row).
-
-    Scene / object parameters
-    -------------------------
-    emissivity, distance, relative_humidity : float or None
-    reflected_temp, atmosphere_temp : float or None
-    ext_optics_temp, ext_optics_transmission : float or None
-
-    Calibration ranges (from XML)
-    -----------------------------
-    range_counts_min/max, range_radiance_min/max,
-    range_temperaturec_min/max, range_temperaturek_min/max,
-    range_temperaturef_min/max, range_temperaturer_min/max : float or None
-
-    Source / display
-    ----------------
-    source_unit : str or None
-    temperature_type : str or None
-    apply_nuc, apply_bp : str or None
-    display_min_c, display_max_c : float or None
-    display_mode : str or None
-    scale_mode : str or None
-    segmentation_enabled : str or None
+    All fields are optional (``None`` when not present in the file).
+    Use :meth:`as_dict` to convert to a plain dictionary or ``str()``
+    for a formatted summary.
     """
 
     # File

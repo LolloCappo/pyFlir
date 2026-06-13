@@ -42,10 +42,12 @@ intersphinx_mapping = {
     "numpy": ("https://numpy.org/doc/stable/", None),
 }
 
-napoleon_google_docstring = False
+napoleon_google_docstring = True
 napoleon_numpy_docstring = True
 napoleon_use_param = True
 napoleon_use_rtype = True
+
+suppress_warnings = ["autodoc.duplicate_object"]
 
 html_theme = "sphinx_book_theme"
 html_static_path = ["_static"]
