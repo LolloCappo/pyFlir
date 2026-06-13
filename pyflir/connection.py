@@ -109,6 +109,7 @@ def _is_usb_adapter(name: str, description: str = "") -> bool:
 def _host_interfaces() -> list[tuple[str, str]]:
     try:
         import psutil
+
         out = []
         for name, addrs in psutil.net_if_addrs().items():
             for a in addrs:
@@ -121,15 +122,23 @@ def _host_interfaces() -> list[tuple[str, str]]:
 
 def _adapter_descriptions() -> dict[str, str]:
     import sys
+
     if not sys.platform.startswith("win"):
         return {}
     try:
         import json
         import subprocess
+
         proc = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-NetAdapter | Select-Object Name,InterfaceDescription | ConvertTo-Json"],
-            capture_output=True, text=True, timeout=5,
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "Get-NetAdapter | Select-Object Name,InterfaceDescription | ConvertTo-Json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         data = json.loads(proc.stdout or "[]")
         if isinstance(data, dict):

@@ -25,11 +25,11 @@ __version__ = "0.2.0"
 
 from pyGigEVision import GVCPClient, GVCPError, GVSPReceiver
 
-from .camera import Camera, CameraError, discover, apply_calibration
+from . import io
+from .camera import Camera, CameraError, apply_calibration, discover
 from .connection import ConnectionReport, tune_connection
 from .errors import ConnectionStats
 from .genicam import RegNode, parse_genicam_xml
-from . import io
 from .io import ATSMetadata, FLIRATSReader, read_ats, read_sfmov, read_sfmov_meta
 from .provisioning import force_ip
 

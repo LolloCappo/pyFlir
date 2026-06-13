@@ -167,7 +167,10 @@ def main(argv: list[str] | None = None) -> int:
     p_grab.add_argument("--ip", default=None)
     p_grab.add_argument("--xml", default=None, help="Path to GenICam XML file")
     p_grab.add_argument(
-        "--exposure-ms", type=float, default=None, dest="exposure_ms",
+        "--exposure-ms",
+        type=float,
+        default=None,
+        dest="exposure_ms",
         help="Integration time in milliseconds",
     )
     p_grab.add_argument("--timeout", type=float, default=5.0)
@@ -190,10 +193,10 @@ def main(argv: list[str] | None = None) -> int:
 
     commands = {
         "discover": cmd_discover,
-        "info":     cmd_info,
-        "grab":     cmd_grab,
-        "live":     cmd_live,
-        "setup":    cmd_setup,
+        "info": cmd_info,
+        "grab": cmd_grab,
+        "live": cmd_live,
+        "setup": cmd_setup,
     }
 
     return commands[args.command](args)
@@ -202,6 +205,7 @@ def main(argv: list[str] | None = None) -> int:
 def _get_version() -> str:
     try:
         from . import __version__
+
         return __version__
     except ImportError:
         return "unknown"

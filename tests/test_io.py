@@ -3,12 +3,12 @@
 import numpy as np
 import pytest
 
-from pyflir.io import FLIRATSReader, ATSMetadata, read_ats
-
+from pyflir.io import ATSMetadata, FLIRATSReader, read_ats
 
 # ---------------------------------------------------------------------------
 # _compute_celsius (linear calibration formula)
 # ---------------------------------------------------------------------------
+
 
 class TestComputeCelsius:
     """Tests for FLIRATSReader._compute_celsius."""
@@ -22,8 +22,10 @@ class TestComputeCelsius:
         # counts at midpoint of [0, 16383] → midpoint of [-20, 55] = 17.5 °C
         raw = np.array([[[8191]]], dtype=np.uint16)
         meta = ATSMetadata(
-            range_counts_min=0.0, range_counts_max=16383.0,
-            range_temperaturec_min=-20.0, range_temperaturec_max=55.0,
+            range_counts_min=0.0,
+            range_counts_max=16383.0,
+            range_temperaturec_min=-20.0,
+            range_temperaturec_max=55.0,
         )
         reader = self._reader_with_raw(raw)
         result = reader._compute_celsius(meta)
@@ -33,8 +35,10 @@ class TestComputeCelsius:
     def test_linear_at_min(self):
         raw = np.array([[[0]]], dtype=np.uint16)
         meta = ATSMetadata(
-            range_counts_min=0.0, range_counts_max=16383.0,
-            range_temperaturec_min=-20.0, range_temperaturec_max=55.0,
+            range_counts_min=0.0,
+            range_counts_max=16383.0,
+            range_temperaturec_min=-20.0,
+            range_temperaturec_max=55.0,
         )
         reader = self._reader_with_raw(raw)
         result = reader._compute_celsius(meta)
@@ -43,8 +47,10 @@ class TestComputeCelsius:
     def test_linear_at_max(self):
         raw = np.array([[[16383]]], dtype=np.uint16)
         meta = ATSMetadata(
-            range_counts_min=0.0, range_counts_max=16383.0,
-            range_temperaturec_min=-20.0, range_temperaturec_max=55.0,
+            range_counts_min=0.0,
+            range_counts_max=16383.0,
+            range_temperaturec_min=-20.0,
+            range_temperaturec_max=55.0,
         )
         reader = self._reader_with_raw(raw)
         result = reader._compute_celsius(meta)
@@ -60,8 +66,10 @@ class TestComputeCelsius:
     def test_returns_none_on_degenerate_range(self):
         raw = np.zeros((1, 4, 4), dtype=np.uint16)
         meta = ATSMetadata(
-            range_counts_min=5000.0, range_counts_max=5000.0,  # hi == lo
-            range_temperaturec_min=0.0, range_temperaturec_max=100.0,
+            range_counts_min=5000.0,
+            range_counts_max=5000.0,  # hi == lo
+            range_temperaturec_min=0.0,
+            range_temperaturec_max=100.0,
         )
         reader = self._reader_with_raw(raw)
         result = reader._compute_celsius(meta)
@@ -70,8 +78,10 @@ class TestComputeCelsius:
     def test_output_shape_matches_input(self):
         raw = np.zeros((5, 8, 10), dtype=np.uint16)
         meta = ATSMetadata(
-            range_counts_min=0.0, range_counts_max=16383.0,
-            range_temperaturec_min=-20.0, range_temperaturec_max=55.0,
+            range_counts_min=0.0,
+            range_counts_max=16383.0,
+            range_temperaturec_min=-20.0,
+            range_temperaturec_max=55.0,
         )
         reader = self._reader_with_raw(raw)
         result = reader._compute_celsius(meta)
@@ -81,8 +91,10 @@ class TestComputeCelsius:
     def test_output_dtype_is_float32(self):
         raw = np.zeros((1, 4, 4), dtype=np.uint16)
         meta = ATSMetadata(
-            range_counts_min=0.0, range_counts_max=16383.0,
-            range_temperaturec_min=-20.0, range_temperaturec_max=55.0,
+            range_counts_min=0.0,
+            range_counts_max=16383.0,
+            range_temperaturec_min=-20.0,
+            range_temperaturec_max=55.0,
         )
         reader = self._reader_with_raw(raw)
         result = reader._compute_celsius(meta)
@@ -92,8 +104,10 @@ class TestComputeCelsius:
         # counts in [3000, 13000] → temperature in [-20, 55]
         raw = np.array([[[8000]]], dtype=np.uint16)
         meta = ATSMetadata(
-            range_counts_min=3000.0, range_counts_max=13000.0,
-            range_temperaturec_min=-20.0, range_temperaturec_max=55.0,
+            range_counts_min=3000.0,
+            range_counts_max=13000.0,
+            range_temperaturec_min=-20.0,
+            range_temperaturec_max=55.0,
         )
         reader = self._reader_with_raw(raw)
         result = reader._compute_celsius(meta)
@@ -104,6 +118,7 @@ class TestComputeCelsius:
 # ---------------------------------------------------------------------------
 # ATSMetadata
 # ---------------------------------------------------------------------------
+
 
 class TestATSMetadata:
     def test_as_dict_returns_dict(self):
@@ -121,38 +136,48 @@ class TestATSMetadata:
     def test_get_temperature_kelvin(self):
         raw = np.ones((1, 4, 4), dtype=np.uint16) * 8191
         meta = ATSMetadata(
-            range_counts_min=0.0, range_counts_max=16383.0,
-            range_temperaturec_min=-20.0, range_temperaturec_max=55.0,
-            width=4, height=4, n_frames=1,
+            range_counts_min=0.0,
+            range_counts_max=16383.0,
+            range_temperaturec_min=-20.0,
+            range_temperaturec_max=55.0,
+            width=4,
+            height=4,
+            n_frames=1,
         )
         reader = FLIRATSReader.__new__(FLIRATSReader)
         reader.raw = raw
         reader.temperature_C = reader._compute_celsius(meta)
         reader.metadata = meta
-        result_K = reader.get_temperature("K")
-        result_C = reader.get_temperature("C")
-        assert abs(float((result_K - result_C)[0, 0, 0]) - 273.15) < 0.01
+        result_k = reader.get_temperature("K")
+        result_c = reader.get_temperature("C")
+        assert abs(float((result_k - result_c)[0, 0, 0]) - 273.15) < 0.01
 
     def test_get_temperature_fahrenheit(self):
         raw = np.zeros((1, 4, 4), dtype=np.uint16)
         meta = ATSMetadata(
-            range_counts_min=0.0, range_counts_max=16383.0,
-            range_temperaturec_min=0.0, range_temperaturec_max=100.0,
-            width=4, height=4, n_frames=1,
+            range_counts_min=0.0,
+            range_counts_max=16383.0,
+            range_temperaturec_min=0.0,
+            range_temperaturec_max=100.0,
+            width=4,
+            height=4,
+            n_frames=1,
         )
         reader = FLIRATSReader.__new__(FLIRATSReader)
         reader.raw = raw
         reader.temperature_C = reader._compute_celsius(meta)
         reader.metadata = meta
-        result_F = reader.get_temperature("F")
-        assert abs(float(result_F[0, 0, 0]) - 32.0) < 0.01  # 0°C = 32°F
+        result_f = reader.get_temperature("F")
+        assert abs(float(result_f[0, 0, 0]) - 32.0) < 0.01  # 0°C = 32°F
 
     def test_get_temperature_invalid_unit_raises(self):
         reader = FLIRATSReader.__new__(FLIRATSReader)
         raw = np.zeros((1, 4, 4), dtype=np.uint16)
         meta = ATSMetadata(
-            range_counts_min=0.0, range_counts_max=100.0,
-            range_temperaturec_min=0.0, range_temperaturec_max=100.0,
+            range_counts_min=0.0,
+            range_counts_max=100.0,
+            range_temperaturec_min=0.0,
+            range_temperaturec_max=100.0,
         )
         reader.raw = raw
         reader.temperature_C = reader._compute_celsius(meta)
@@ -172,6 +197,7 @@ class TestATSMetadata:
 # ---------------------------------------------------------------------------
 # read_ats raises on non-ATS file
 # ---------------------------------------------------------------------------
+
 
 class TestReadATSValidation:
     def test_raises_on_non_ats_file(self, tmp_path):

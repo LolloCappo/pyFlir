@@ -112,8 +112,8 @@ cam.trigger_nuc()                  # trigger non-uniformity correction
 cam.set_object_params(
     emissivity  = 0.95,
     distance_m  = 3.0,
-    atm_temp_K  = 293.15,
-    refl_temp_K = 293.15,
+    atm_temp_k  = 293.15,
+    refl_temp_k = 293.15,
     humidity    = 0.50,
 )
 print(cam.get_object_params())

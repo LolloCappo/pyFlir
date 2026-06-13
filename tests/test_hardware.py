@@ -17,9 +17,7 @@ def cam():
     camera = Camera()
     camera.connect()
     camera.download_xml()
-    camera.load_xml(
-        f"camera_{camera.serial or camera.ip.replace('.', '_')}.xml"
-    )
+    camera.load_xml(f"camera_{camera.serial or camera.ip.replace('.', '_')}.xml")
     yield camera
     camera.disconnect()
 
@@ -121,7 +119,7 @@ class TestTemperatures:
         temps = cam.get_temperatures()
         assert isinstance(temps, dict)
         assert len(temps) > 0
-        for name, t in temps.items():
+        for _name, t in temps.items():
             assert isinstance(t, float)
 
 
@@ -129,10 +127,10 @@ class TestTemperatures:
 class TestROI:
     def test_get_roi(self, cam):
         roi = cam.get_roi()
-        assert roi["width"]  > 0
+        assert roi["width"] > 0
         assert roi["height"] > 0
 
     def test_get_roi_limits(self, cam):
         limits = cam.get_roi_limits()
-        assert limits["sensor_width"]  > 0
+        assert limits["sensor_width"] > 0
         assert limits["sensor_height"] > 0

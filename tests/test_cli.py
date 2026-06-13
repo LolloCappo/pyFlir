@@ -1,6 +1,6 @@
 """Tests for CLI commands (no camera needed for most)."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 

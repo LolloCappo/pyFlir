@@ -1,7 +1,6 @@
 """Tests for apply_calibration() and the two-polynomial radiometric conversion."""
 
 import numpy as np
-import pytest
 
 from pyflir.camera import apply_calibration
 
@@ -12,7 +11,7 @@ def _make_cal(
     counts_min: float = 0.0,
     counts_max: float = 16383.0,
     counts_coeffs=None,  # lowest degree first
-    temp_coeffs=None,    # lowest degree first
+    temp_coeffs=None,  # lowest degree first
     kelvin_output: bool = False,
     counts_background: float = 0.0,
 ) -> dict:
@@ -27,23 +26,18 @@ def _make_cal(
         counts_coeffs = [0.0, 1.0 / counts_max]
 
     if temp_coeffs is None:
-        if kelvin_output:
-            # T_K = (tmin+273.15) + (tmax-tmin) * W
-            temp_coeffs = [tmin + 273.15, tmax - tmin]
-        else:
-            # T_C = tmin + (tmax-tmin) * W
-            temp_coeffs = [tmin, tmax - tmin]
+        temp_coeffs = [tmin + 273.15, tmax - tmin] if kelvin_output else [tmin, tmax - tmin]
 
     return {
-        "tmin":               tmin,
-        "tmax":               tmax,
-        "counts_min":         counts_min,
-        "counts_max":         counts_max,
-        "counts_order":       len(counts_coeffs) - 1,
-        "counts_coeffs":      counts_coeffs,
-        "counts_background":  counts_background,
-        "temp_order":         len(temp_coeffs) - 1,
-        "temp_coeffs":        temp_coeffs,
+        "tmin": tmin,
+        "tmax": tmax,
+        "counts_min": counts_min,
+        "counts_max": counts_max,
+        "counts_order": len(counts_coeffs) - 1,
+        "counts_coeffs": counts_coeffs,
+        "counts_background": counts_background,
+        "temp_order": len(temp_coeffs) - 1,
+        "temp_coeffs": temp_coeffs,
     }
 
 

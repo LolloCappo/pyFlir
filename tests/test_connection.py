@@ -20,15 +20,11 @@ class TestLinkLocalWarning:
         assert _link_local_warning([("eth0", "192.168.1.5")]) is None
 
     def test_multiple_link_local_warns(self):
-        w = _link_local_warning(
-            [("eth0", "169.254.10.1"), ("eth1", "169.254.20.1")]
-        )
+        w = _link_local_warning([("eth0", "169.254.10.1"), ("eth1", "169.254.20.1")])
         assert w is not None
 
     def test_vpn_named_adapter_warns(self):
-        w = _link_local_warning(
-            [("eth0", "169.254.10.1"), ("tailscale0", "100.64.0.1")]
-        )
+        w = _link_local_warning([("eth0", "169.254.10.1"), ("tailscale0", "100.64.0.1")])
         assert w is not None
 
 

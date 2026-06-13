@@ -18,28 +18,26 @@ Usage::
         cam.stop_stream()
 """
 
+import contextlib
 import logging
 import socket
 import struct
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
 
 import numpy as np
-
-logger = logging.getLogger(__name__)
-
 from pyGigEVision import GVCPClient, GVCPError, GVSPReceiver
 from pyGigEVision.standard import (
-    REG_SC_HOST_PORT,
-    REG_SC_PACKET_SIZE,
-    REG_SC_PACKET_DELAY,
     REG_SC_DEST_ADDR,
+    REG_SC_HOST_PORT,
+    REG_SC_PACKET_DELAY,
+    REG_SC_PACKET_SIZE,
 )
 
-from .genicam import parse_genicam_xml, RegNode, fetch_genicam_xml
 from . import registers as reg
+from .genicam import RegNode, fetch_genicam_xml, parse_genicam_xml
 
+logger = logging.getLogger(__name__)
 
 # Default MTU-safe packet size for 1 GbE without jumbo frames
 DEFAULT_PACKET_SIZE = 1500
@@ -47,26 +45,27 @@ DEFAULT_PACKET_SIZE = 1500
 # SFNC → FLIR-camera-specific feature name aliases.
 # Populated by load_xml() after inspecting available node names.
 _SFNC_CANDIDATES = {
-    "Width":                   ["Width", "WidthReg"],
-    "Height":                  ["Height", "HeightReg"],
-    "PixelFormat":             ["PixelFormat", "PixelFormatReg"],
-    "AcquisitionStart":        ["AcquisitionStart", "AcquisitionStartReg"],
-    "AcquisitionStop":         ["AcquisitionStop", "AcquisitionStopReg"],
-    "AcquisitionMode":         ["AcquisitionMode", "AcquisitionModeReg"],
-    "ExposureTime":            ["ExposureTime", "PS0IntegrationTimeReg",
-                                "IntegrationTimeReg"],
-    "AcquisitionFrameRate":    ["AcquisitionFrameRate", "PS0FrameRateReg",
-                                "FrameRateReg", "SuperframeRateReg"],
-    "AcquisitionFrameRateMax": ["PS0FrameRateMax", "AcquisitionFrameRateMax",
-                                "FrameRateMax"],
-    "DeviceTemperature":       ["DeviceTemperature", "FPAColdReg",
-                                "FPATemperatureReg"],
-    "Emissivity":              ["ObjectEmissivityReg"],
-    "ObjectDistance":          ["ObjectDistanceReg"],
-    "AtmosphericTemperature":  ["AtmosphericTemperatureReg"],
-    "ReflectedTemperature":    ["ReflectedTemperatureReg"],
-    "RelativeHumidity":        ["RelativeHumidityReg"],
-    "CalibrationBlock":        ["CalibrationQueryIndexReg"],
+    "Width": ["Width", "WidthReg"],
+    "Height": ["Height", "HeightReg"],
+    "PixelFormat": ["PixelFormat", "PixelFormatReg"],
+    "AcquisitionStart": ["AcquisitionStart", "AcquisitionStartReg"],
+    "AcquisitionStop": ["AcquisitionStop", "AcquisitionStopReg"],
+    "AcquisitionMode": ["AcquisitionMode", "AcquisitionModeReg"],
+    "ExposureTime": ["ExposureTime", "PS0IntegrationTimeReg", "IntegrationTimeReg"],
+    "AcquisitionFrameRate": [
+        "AcquisitionFrameRate",
+        "PS0FrameRateReg",
+        "FrameRateReg",
+        "SuperframeRateReg",
+    ],
+    "AcquisitionFrameRateMax": ["PS0FrameRateMax", "AcquisitionFrameRateMax", "FrameRateMax"],
+    "DeviceTemperature": ["DeviceTemperature", "FPAColdReg", "FPATemperatureReg"],
+    "Emissivity": ["ObjectEmissivityReg"],
+    "ObjectDistance": ["ObjectDistanceReg"],
+    "AtmosphericTemperature": ["AtmosphericTemperatureReg"],
+    "ReflectedTemperature": ["ReflectedTemperatureReg"],
+    "RelativeHumidity": ["RelativeHumidityReg"],
+    "CalibrationBlock": ["CalibrationQueryIndexReg"],
 }
 
 
@@ -104,30 +103,30 @@ class Camera:
 
     def __init__(
         self,
-        ip: Optional[str] = None,
-        interface_ip: Optional[str] = None,
+        ip: str | None = None,
+        interface_ip: str | None = None,
         timeout: float = 2.0,
     ):
-        self.ip           = ip
+        self.ip = ip
         self.interface_ip = interface_ip or ""
-        self._timeout     = timeout
+        self._timeout = timeout
 
-        self._gvcp: Optional[GVCPClient]    = None
-        self._gvsp: Optional[GVSPReceiver]  = None
-        self._nodes: Dict[str, RegNode]     = {}
-        self._aliases: Dict[str, str]       = {}
-        self._streaming: bool               = False
+        self._gvcp: GVCPClient | None = None
+        self._gvsp: GVSPReceiver | None = None
+        self._nodes: dict[str, RegNode] = {}
+        self._aliases: dict[str, str] = {}
+        self._streaming: bool = False
 
         # Populated after load_xml() or connect()
-        self.width:  Optional[int] = None
-        self.height: Optional[int] = None
+        self.width: int | None = None
+        self.height: int | None = None
         self.serial: str = ""
-        self.model:  str = ""
+        self.model: str = ""
         # Number of trailing metadata rows the camera appends to each frame.
         # These rows are stripped from grab()/read() results and exposed via
         # the last_metadata_rows attribute after each acquisition.
         self._metadata_rows: int = 0
-        self.last_metadata_rows: Optional["np.ndarray"] = None
+        self.last_metadata_rows: np.ndarray | None = None
 
     # ------------------------------------------------------------------
     # Context manager
@@ -153,13 +152,13 @@ class Camera:
         lines = [f"Camera  {self.model or '?'}  s/n {self.serial or '?'}  @ {self.ip}"]
         lines.append(f"  streaming : {self._streaming}")
         if self._nodes:
-            w    = _s(lambda: self.read_int("Width"))
-            h    = _s(lambda: self.read_int("Height"))
-            fps  = _s(lambda: f"{self.read_float('AcquisitionFrameRate'):.1f} Hz")
+            w = _s(lambda: self.read_int("Width"))
+            h = _s(lambda: self.read_int("Height"))
+            fps = _s(lambda: f"{self.read_float('AcquisitionFrameRate'):.1f} Hz")
             fmax = _s(lambda: f"{self.get_max_frame_rate():.1f} Hz")
-            exp  = _s(lambda: f"{self.read_float('ExposureTime') * 1e3:.3f} ms")
+            exp = _s(lambda: f"{self.read_float('ExposureTime') * 1e3:.3f} ms")
             temp = _s(lambda: f"{self.read_float('DeviceTemperature'):.1f} °C")
-            cal  = _s(lambda: self._gvcp.read_reg(reg.REG_CAL_INDEX))
+            cal = _s(lambda: self._gvcp.read_reg(reg.REG_CAL_INDEX))
             lines.append(f"  ROI       : {w} × {h} px")
             lines.append(f"  frame rate: {fps}  (max {fmax})")
             lines.append(f"  exposure  : {exp}")
@@ -188,9 +187,7 @@ class Camera:
                 "Discovering cameras on %s…",
                 self.interface_ip or "all interfaces",
             )
-            found = GVCPClient.discover(
-                interface_ip=self.interface_ip, timeout=3.0
-            )
+            found = GVCPClient.discover(interface_ip=self.interface_ip, timeout=3.0)
             if not found:
                 raise CameraError(
                     "No GigE Vision cameras found. Check:\n"
@@ -201,9 +198,9 @@ class Camera:
                     "  Tip: Camera(interface_ip='<your NIC IP>')"
                 )
             cam_info = found[0]
-            self.ip     = cam_info["ip"]
+            self.ip = cam_info["ip"]
             self.serial = cam_info.get("serial", "")
-            self.model  = cam_info.get("model", "")
+            self.model = cam_info.get("model", "")
             if not self.interface_ip:
                 # Reuse the NIC that received the discovery reply for
                 # control and streaming.
@@ -231,6 +228,7 @@ class Camera:
                 pass
 
         import time as _time
+
         local_ip = self._local_ip()
         # pyGigEVision's connect() already polls for ACCESS_DENIED up to 15 s.
         # FLIR cameras can have a heartbeat timeout up to 60 s, so we recreate
@@ -259,10 +257,8 @@ class Camera:
         # Search docs/ then the working directory for camera_*.xml files.
         if not self._nodes:
             import glob as _glob
-            candidates = (
-                _glob.glob("docs/camera_*.xml")
-                + _glob.glob("camera_*.xml")
-            )
+
+            candidates = _glob.glob("docs/camera_*.xml") + _glob.glob("camera_*.xml")
             if candidates:
                 try:
                     self.load_xml(candidates[0])
@@ -298,7 +294,7 @@ class Camera:
     # GenICam XML
     # ------------------------------------------------------------------
 
-    def download_xml(self, save_path: Optional[str] = None) -> bytes:
+    def download_xml(self, save_path: str | None = None) -> bytes:
         """Download the GenICam XML from the camera and save it to disk.
 
         Uses pyGigEVision to fetch and decompress the descriptor stored
@@ -320,7 +316,9 @@ class Camera:
         Path(save_path).write_bytes(xml_bytes)
         logger.info(
             "Saved %d bytes of GenICam XML (%s) → %s",
-            len(xml_bytes), xml_filename, save_path,
+            len(xml_bytes),
+            xml_filename,
+            save_path,
         )
         return xml_bytes
 
@@ -349,7 +347,7 @@ class Camera:
 
         self._require_connected()
         try:
-            self.width  = self.read_int("Width")
+            self.width = self.read_int("Width")
             self.height = self.read_int("Height")
             logger.info("Image size: %d × %d", self.width, self.height)
         except (KeyError, CameraError) as exc:
@@ -368,7 +366,8 @@ class Camera:
                     self.height = sensor_h
                     logger.info(
                         "Detected %d metadata row(s); effective height → %d",
-                        self._metadata_rows, self.height,
+                        self._metadata_rows,
+                        self.height,
                     )
             except Exception:
                 pass
@@ -379,7 +378,7 @@ class Camera:
             # FLIR-specific registers hold the product name (e.g. "A6751sc");
             # DeviceModelName is the platform / firmware family name ("Xsc Series").
             # Always overwrite; GVCP discovery values are less specific than XML registers.
-            ("model",  ["CameraModel", "MfgDeviceModelName", "DeviceModelName"]),
+            ("model", ["CameraModel", "MfgDeviceModelName", "DeviceModelName"]),
             ("serial", ["CameraSerial", "DeviceSerialNumber", "DeviceID"]),
         ):
             for feat in candidates:
@@ -436,10 +435,10 @@ class Camera:
         logger.debug("GVSP receiver on %s:%d", local_ip, dest_port)
 
         dest_ip_int = struct.unpack(">I", socket.inet_aton(local_ip))[0]
-        self._gvcp.write_reg(REG_SC_HOST_PORT,    dest_port)
-        self._gvcp.write_reg(REG_SC_PACKET_SIZE,  packet_size & 0xFFFF)
+        self._gvcp.write_reg(REG_SC_HOST_PORT, dest_port)
+        self._gvcp.write_reg(REG_SC_PACKET_SIZE, packet_size & 0xFFFF)
         self._gvcp.write_reg(REG_SC_PACKET_DELAY, packet_delay)
-        self._gvcp.write_reg(REG_SC_DEST_ADDR,    dest_ip_int)
+        self._gvcp.write_reg(REG_SC_DEST_ADDR, dest_ip_int)
 
         self.execute_command("AcquisitionStart")
         self._streaming = True
@@ -454,10 +453,8 @@ class Camera:
         except Exception as exc:
             logger.warning("AcquisitionStop failed: %s", exc)
         # Zero out stream channel so camera stops sending
-        try:
+        with contextlib.suppress(Exception):
             self._gvcp.write_reg(REG_SC_HOST_PORT, 0)
-        except Exception:
-            pass
         self._streaming = False
         if self._gvsp:
             self._gvsp.stop()
@@ -472,8 +469,8 @@ class Camera:
     def _strip_metadata(self, frame: np.ndarray) -> np.ndarray:
         """Strip trailing metadata rows and cache them in last_metadata_rows."""
         if self._metadata_rows and frame.shape[0] > self._metadata_rows:
-            self.last_metadata_rows = frame[-self._metadata_rows:]
-            return frame[:-self._metadata_rows]
+            self.last_metadata_rows = frame[-self._metadata_rows :]
+            return frame[: -self._metadata_rows]
         return frame
 
     def grab(self, timeout: float = 5.0) -> np.ndarray:
@@ -513,9 +510,7 @@ class Camera:
         if latest:
             frame = None
             while True:
-                candidate = self._gvsp.get_frame(
-                    timeout=timeout if frame is None else 0.0
-                )
+                candidate = self._gvsp.get_frame(timeout=timeout if frame is None else 0.0)
                 if candidate is None:
                     break
                 frame = candidate
@@ -538,7 +533,7 @@ class Camera:
             )
         return self._strip_metadata(frame)
 
-    def acquire(self, n_frames: int, timeout: float = 30.0) -> List[np.ndarray]:
+    def acquire(self, n_frames: int, timeout: float = 30.0) -> list[np.ndarray]:
         """Capture exactly ``n_frames`` frames and return them as a list.
 
         If streaming is already active, reads from the live stream. Otherwise
@@ -563,8 +558,7 @@ class Camera:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise CameraError(
-                        f"Timeout: acquired {len(frames)}/{n_frames} frames "
-                        f"in {timeout:.1f} s"
+                        f"Timeout: acquired {len(frames)}/{n_frames} frames in {timeout:.1f} s"
                     )
                 frame = self._gvsp.get_frame(timeout=min(remaining, 2.0))
                 if frame is not None:
@@ -620,12 +614,11 @@ class Camera:
         if entry_name not in node.enum_entries:
             valid = list(node.enum_entries.keys())
             raise CameraError(
-                f"Invalid enum value '{entry_name}' for '{feature}'. "
-                f"Valid values: {valid}"
+                f"Invalid enum value '{entry_name}' for '{feature}'. Valid values: {valid}"
             )
         self._gvcp.write_reg(node.address, node.enum_entries[entry_name])
 
-    def list_features(self) -> Dict[str, RegNode]:
+    def list_features(self) -> dict[str, RegNode]:
         """Return the full register map loaded from GenICam XML."""
         return self._nodes
 
@@ -649,7 +642,7 @@ class Camera:
         self.write_float("AcquisitionFrameRate", fps)
 
     @property
-    def frame_rate_max(self) -> Optional[float]:
+    def frame_rate_max(self) -> float | None:
         """Maximum frame rate for the current ROI (read-only, from camera)."""
         return self.get_max_frame_rate()
 
@@ -703,7 +696,7 @@ class Camera:
         """Return detector temperature in degrees Celsius."""
         return self.detector_temperature
 
-    def get_max_frame_rate(self) -> Optional[float]:
+    def get_max_frame_rate(self) -> float | None:
         """Return camera's max frame rate for the current ROI, or None."""
         try:
             return self.read_float("AcquisitionFrameRateMax")
@@ -714,16 +707,16 @@ class Camera:
     # Calibration blocks (temperature range selection)
     # ------------------------------------------------------------------
 
-    def get_calibration_blocks(self) -> List[dict]:
+    def get_calibration_blocks(self) -> list[dict]:
         """Return a list of all calibration blocks with their temperature ranges.
 
         Each entry has keys: ``index``, ``name``, ``lens``, ``tmin``, ``tmax``.
         Temporarily iterates all blocks and restores the original selection.
         """
         self._require_connected()
-        n_max   = self._gvcp.read_reg(reg.REG_CAL_INDEX_MAX)
+        n_max = self._gvcp.read_reg(reg.REG_CAL_INDEX_MAX)
         current = self._gvcp.read_reg(reg.REG_CAL_INDEX)
-        blocks  = []
+        blocks = []
         for i in range(n_max + 1):
             self._gvcp.write_reg(reg.REG_CAL_INDEX, i)
             tmin = self._gvcp.read_float(reg.REG_CAL_TMIN)
@@ -738,8 +731,7 @@ class Camera:
 
             name = _readstr(reg.REG_CAL_NAME)
             lens = _readstr(reg.REG_CAL_LENS)
-            blocks.append({"index": i, "tmin": tmin, "tmax": tmax,
-                           "name": name, "lens": lens})
+            blocks.append({"index": i, "tmin": tmin, "tmax": tmax, "name": name, "lens": lens})
         self._gvcp.write_reg(reg.REG_CAL_INDEX, current)
         return blocks
 
@@ -753,7 +745,7 @@ class Camera:
         self._require_connected()
         self._gvcp.write_reg(reg.REG_CAL_INDEX, index)
 
-    def get_calibration(self, block: Optional[int] = None) -> dict:
+    def get_calibration(self, block: int | None = None) -> dict:
         """Read calibration data for a calibration block.
 
         If *block* is ``None`` the currently active block is used.
@@ -777,26 +769,22 @@ class Camera:
             self._gvcp.write_reg(reg.REG_CAL_INDEX, block)
         try:
             c_order = self.read_int("CalibrationQueryOrderReg")
-            c_coeffs = [
-                self.read_float(f"CalibrationQueryCoeff{i}Reg")
-                for i in range(c_order + 1)
-            ]
+            c_coeffs = [self.read_float(f"CalibrationQueryCoeff{i}Reg") for i in range(c_order + 1)]
             t_order = self.read_int("CalibrationQueryTempOrderReg")
             t_coeffs = [
-                self.read_float(f"CalibrationQueryTempCoeff{i}Reg")
-                for i in range(t_order + 1)
+                self.read_float(f"CalibrationQueryTempCoeff{i}Reg") for i in range(t_order + 1)
             ]
             return {
-                "block":             self._gvcp.read_reg(reg.REG_CAL_INDEX),
-                "tmin":              self._gvcp.read_float(reg.REG_CAL_TMIN),
-                "tmax":              self._gvcp.read_float(reg.REG_CAL_TMAX),
-                "counts_min":        self.read_float("CalibrationQueryMinCountsReg"),
-                "counts_max":        self.read_float("CalibrationQueryMaxCountsReg"),
-                "counts_order":      c_order,
-                "counts_coeffs":     c_coeffs,
+                "block": self._gvcp.read_reg(reg.REG_CAL_INDEX),
+                "tmin": self._gvcp.read_float(reg.REG_CAL_TMIN),
+                "tmax": self._gvcp.read_float(reg.REG_CAL_TMAX),
+                "counts_min": self.read_float("CalibrationQueryMinCountsReg"),
+                "counts_max": self.read_float("CalibrationQueryMaxCountsReg"),
+                "counts_order": c_order,
+                "counts_coeffs": c_coeffs,
                 "counts_background": self.read_float("CalibrationQueryBackgroundValueReg"),
-                "temp_order":        t_order,
-                "temp_coeffs":       t_coeffs,
+                "temp_order": t_order,
+                "temp_coeffs": t_coeffs,
             }
         finally:
             if block is not None:
@@ -805,9 +793,9 @@ class Camera:
     def counts_to_temperature(
         self,
         counts: "np.ndarray",
-        emissivity: Optional[float] = None,
-        refl_temp_C: Optional[float] = None,
-        atm_temp_C: Optional[float] = None,
+        emissivity: float | None = None,
+        refl_temp_c: float | None = None,
+        atm_temp_c: float | None = None,
         tau: float = 1.0,
     ) -> "np.ndarray":
         """Convert a raw uint16 frame to temperature in degrees Celsius.
@@ -818,14 +806,14 @@ class Camera:
         1. counts → radiance:  W = Σ counts_coeffs[i] · counts^i − background
         2. radiance → °C:      T_C = Σ temp_coeffs[i] · W^i
 
-        If *emissivity*, *refl_temp_C*, or *atm_temp_C* are omitted they
+        If *emissivity*, *refl_temp_c*, or *atm_temp_c* are omitted they
         default to the values previously set via :meth:`set_object_params`.
 
         Args:
             counts:      2-D uint16 array (H, W) from :meth:`grab` or :meth:`read`.
             emissivity:  Object surface emissivity (0–1).
-            refl_temp_C: Reflected apparent temperature in °C.
-            atm_temp_C:  Atmospheric temperature in °C.
+            refl_temp_c: Reflected apparent temperature in °C.
+            atm_temp_c:  Atmospheric temperature in °C.
             tau:         Atmospheric transmission (0–1). 1 = no atmosphere.
 
         Returns:
@@ -837,22 +825,22 @@ class Camera:
             temp  = cam.counts_to_temperature(frame)
             print(f"Centre pixel: {temp[256, 320]:.1f} °C")
         """
-        if emissivity is None or refl_temp_C is None or atm_temp_C is None:
+        if emissivity is None or refl_temp_c is None or atm_temp_c is None:
             try:
                 params = self.get_object_params()
                 if emissivity is None:
                     emissivity = params.get("emissivity", 1.0)
-                if refl_temp_C is None:
-                    refl_temp_C = params.get("reflected_temp_K", 296.15) - 273.15
-                if atm_temp_C is None:
-                    atm_temp_C = params.get("atmospheric_temp_K", 296.15) - 273.15
+                if refl_temp_c is None:
+                    refl_temp_c = params.get("reflected_temp_K", 296.15) - 273.15
+                if atm_temp_c is None:
+                    atm_temp_c = params.get("atmospheric_temp_K", 296.15) - 273.15
             except Exception:
-                emissivity  = emissivity  if emissivity  is not None else 1.0
-                refl_temp_C = refl_temp_C if refl_temp_C is not None else 23.0
-                atm_temp_C  = atm_temp_C  if atm_temp_C  is not None else 23.0
+                emissivity = emissivity if emissivity is not None else 1.0
+                refl_temp_c = refl_temp_c if refl_temp_c is not None else 23.0
+                atm_temp_c = atm_temp_c if atm_temp_c is not None else 23.0
 
         cal = self.get_calibration()
-        return apply_calibration(counts, cal, emissivity, refl_temp_C, atm_temp_C, tau)
+        return apply_calibration(counts, cal, emissivity, refl_temp_c, atm_temp_c, tau)
 
     # ------------------------------------------------------------------
     # Radiometry parameters
@@ -867,27 +855,32 @@ class Camera:
     def get_object_params(self) -> dict:
         """Return radiometry object parameters as a dict."""
         return {
-            "emissivity":          self.read_float("Emissivity"),
-            "object_distance_m":   self.read_float("ObjectDistance"),
-            "atmospheric_temp_K":  self.read_float("AtmosphericTemperature"),
-            "reflected_temp_K":    self.read_float("ReflectedTemperature"),
-            "relative_humidity":   self.read_float("RelativeHumidity"),
+            "emissivity": self.read_float("Emissivity"),
+            "object_distance_m": self.read_float("ObjectDistance"),
+            "atmospheric_temp_K": self.read_float("AtmosphericTemperature"),
+            "reflected_temp_K": self.read_float("ReflectedTemperature"),
+            "relative_humidity": self.read_float("RelativeHumidity"),
         }
 
     def set_object_params(
         self,
-        emissivity: Optional[float] = None,
-        distance_m: Optional[float] = None,
-        atm_temp_K: Optional[float] = None,
-        refl_temp_K: Optional[float] = None,
-        humidity: Optional[float] = None,
+        emissivity: float | None = None,
+        distance_m: float | None = None,
+        atm_temp_k: float | None = None,
+        refl_temp_k: float | None = None,
+        humidity: float | None = None,
     ) -> None:
         """Set radiometry object parameters (any subset)."""
-        if emissivity  is not None: self.write_float("Emissivity",             emissivity)
-        if distance_m  is not None: self.write_float("ObjectDistance",         distance_m)
-        if atm_temp_K  is not None: self.write_float("AtmosphericTemperature", atm_temp_K)
-        if refl_temp_K is not None: self.write_float("ReflectedTemperature",   refl_temp_K)
-        if humidity    is not None: self.write_float("RelativeHumidity",        humidity)
+        if emissivity is not None:
+            self.write_float("Emissivity", emissivity)
+        if distance_m is not None:
+            self.write_float("ObjectDistance", distance_m)
+        if atm_temp_k is not None:
+            self.write_float("AtmosphericTemperature", atm_temp_k)
+        if refl_temp_k is not None:
+            self.write_float("ReflectedTemperature", refl_temp_k)
+        if humidity is not None:
+            self.write_float("RelativeHumidity", humidity)
 
     # ------------------------------------------------------------------
     # ROI / Resolution
@@ -901,8 +894,8 @@ class Camera:
         """
         self._require_connected()
         return {
-            "width":    self.read_int("Width"),
-            "height":   self.read_int("Height") - self._metadata_rows,
+            "width": self.read_int("Width"),
+            "height": self.read_int("Height") - self._metadata_rows,
             "offset_x": self._gvcp.read_reg(reg.REG_OFFSET_X),
             "offset_y": self._gvcp.read_reg(reg.REG_OFFSET_Y),
         }
@@ -915,13 +908,13 @@ class Camera:
         self._require_connected()
         h_min_raw = self._gvcp.read_reg(reg.REG_HEIGHT_MIN)
         return {
-            "width_min":     self._gvcp.read_reg(reg.REG_WIDTH_MIN),
-            "width_inc":     self._gvcp.read_reg(reg.REG_WIDTH_INC),
+            "width_min": self._gvcp.read_reg(reg.REG_WIDTH_MIN),
+            "width_inc": self._gvcp.read_reg(reg.REG_WIDTH_INC),
             # REG_HEIGHT_MIN counts total rows (image + metadata); subtract so
             # the returned value represents the minimum usable image rows.
-            "height_min":    max(1, h_min_raw - self._metadata_rows),
-            "height_inc":    self._gvcp.read_reg(reg.REG_HEIGHT_INC),
-            "sensor_width":  reg.SENSOR_WIDTH,
+            "height_min": max(1, h_min_raw - self._metadata_rows),
+            "height_inc": self._gvcp.read_reg(reg.REG_HEIGHT_INC),
+            "sensor_width": reg.SENSOR_WIDTH,
             "sensor_height": reg.SENSOR_HEIGHT,
         }
 
@@ -959,9 +952,7 @@ class Camera:
         if width < w_min:
             raise CameraError(f"Width {width} is below the minimum {w_min}.")
         if w_inc > 0 and (width % w_inc) != 0:
-            raise CameraError(
-                f"Width {width} is not a multiple of the increment {w_inc}."
-            )
+            raise CameraError(f"Width {width} is not a multiple of the increment {w_inc}.")
         if width + offset_x > w_max:
             raise CameraError(
                 f"Width {width} + offset_x {offset_x} = {width + offset_x} "
@@ -985,13 +976,17 @@ class Camera:
         self.write_int("Width", width)
         # Write image rows + metadata rows so the camera gets the correct total
         self.write_int("Height", height + self._metadata_rows)
-        self.width  = self.read_int("Width")
+        self.width = self.read_int("Width")
         self.height = self.read_int("Height") - self._metadata_rows
         max_fps = self.frame_rate_max
         fps_str = f"  max FPS now: {max_fps:.1f} Hz" if max_fps else ""
         logger.info(
             "ROI set: %d×%d  offset (%d,%d)%s",
-            self.width, self.height, offset_x, offset_y, fps_str,
+            self.width,
+            self.height,
+            offset_x,
+            offset_y,
+            fps_str,
         )
 
     # ------------------------------------------------------------------
@@ -1034,7 +1029,7 @@ class Camera:
     # Diagnostics
     # ------------------------------------------------------------------
 
-    def get_temperatures(self) -> Dict[str, float]:
+    def get_temperatures(self) -> dict[str, float]:
         """Read all available on-board temperature sensors.
 
         Returns a dict with keys ``FPA``, ``Digitizer``, ``PowerBoard``,
@@ -1043,7 +1038,7 @@ class Camera:
         """
         self._require_connected()
         original = self._gvcp.read_reg(reg.REG_TEMP_SELECTOR)
-        temps: Dict[str, float] = {}
+        temps: dict[str, float] = {}
         try:
             for name, idx in reg.TEMP_SENSORS.items():
                 self._gvcp.write_reg(reg.REG_TEMP_SELECTOR, idx)
@@ -1059,9 +1054,9 @@ class Camera:
         calibration block, detector temperature, and streaming status.
         """
         out: dict = {
-            "ip":        self.ip,
-            "model":     self.model,
-            "serial":    self.serial,
+            "ip": self.ip,
+            "model": self.model,
+            "serial": self.serial,
             "streaming": self._streaming,
         }
         if not self._nodes:
@@ -1073,22 +1068,14 @@ class Camera:
             except Exception:
                 return None
 
-        out["width"]             = _safe(lambda: self.read_int("Width"))
-        out["height"]            = _safe(lambda: self.read_int("Height") - self._metadata_rows)
-        out["frame_rate_hz"]     = _safe(
-            lambda: round(self.read_float("AcquisitionFrameRate"), 2)
-        )
+        out["width"] = _safe(lambda: self.read_int("Width"))
+        out["height"] = _safe(lambda: self.read_int("Height") - self._metadata_rows)
+        out["frame_rate_hz"] = _safe(lambda: round(self.read_float("AcquisitionFrameRate"), 2))
         fmax = self.get_max_frame_rate()
         out["frame_rate_max_hz"] = round(fmax, 2) if fmax is not None else None
-        out["exposure_ms"]       = _safe(
-            lambda: round(self.read_float("ExposureTime") * 1e3, 3)
-        )
-        out["detector_temp_C"]   = _safe(
-            lambda: round(self.read_float("DeviceTemperature"), 2)
-        )
-        out["calibration_block"] = _safe(
-            lambda: self._gvcp.read_reg(reg.REG_CAL_INDEX)
-        )
+        out["exposure_ms"] = _safe(lambda: round(self.read_float("ExposureTime") * 1e3, 3))
+        out["detector_temp_C"] = _safe(lambda: round(self.read_float("DeviceTemperature"), 2))
+        out["calibration_block"] = _safe(lambda: self._gvcp.read_reg(reg.REG_CAL_INDEX))
         return out
 
     # ------------------------------------------------------------------
@@ -1108,6 +1095,7 @@ class Camera:
             scale: Display upscale factor (default 2 = double size).
         """
         from .gui import LiveView
+
         viewer = LiveView(self, colormap=colormap, scale=scale)
         viewer.run()
 
@@ -1164,12 +1152,13 @@ class Camera:
 # Standalone radiometric conversion (works offline with a cached cal dict)
 # ---------------------------------------------------------------------------
 
+
 def apply_calibration(
     counts: np.ndarray,
     cal: dict,
     emissivity: float = 1.0,
-    refl_temp_C: float = 23.0,
-    atm_temp_C: float = 23.0,
+    refl_temp_c: float = 23.0,
+    atm_temp_c: float = 23.0,
     tau: float = 1.0,
 ) -> np.ndarray:
     """Convert raw uint16 counts to °C using a pre-read calibration dict.
@@ -1201,9 +1190,9 @@ def apply_calibration(
         Calibration dict from :meth:`Camera.get_calibration`.
     emissivity : float
         Unused (reserved). Default 1.0.
-    refl_temp_C : float
+    refl_temp_c : float
         Unused (reserved). Default 23.0.
-    atm_temp_C : float
+    atm_temp_c : float
         Unused (reserved). Default 23.0.
     tau : float
         Unused (reserved). Default 1.0.
@@ -1214,9 +1203,7 @@ def apply_calibration(
         Float64 array (H, W) with temperature in degrees Celsius.
     """
     cmin = float(cal["counts_min"])
-    cmax = float(cal["counts_max"])
     tmin = float(cal["tmin"])
-    tmax = float(cal["tmax"])
 
     # The A6751sc has a 14-bit ADC but GigE Vision streams Mono16 with the
     # value left-justified (uint16 = adc_14bit << 2).  The calibration
@@ -1225,35 +1212,34 @@ def apply_calibration(
     x = counts.astype(np.float64) / 4.0
 
     # Two-polynomial radiometric conversion (no background subtraction):
-    #   1. counts (14-bit) → radiance W
-    #   2. radiance W → temperature
+    #   1. counts (14-bit) → radiance w
+    #   2. radiance w → temperature
     # np.polyval expects highest-degree coefficient first; the camera stores
     # them lowest-degree first, so reverse before calling polyval.
     c_hi = np.asarray(cal["counts_coeffs"], dtype=np.float64)[::-1]
-    t_hi = np.asarray(cal["temp_coeffs"],   dtype=np.float64)[::-1]
-    W = np.polyval(c_hi, x)
-    T = np.polyval(t_hi, W)
+    t_hi = np.asarray(cal["temp_coeffs"], dtype=np.float64)[::-1]
+    w = np.polyval(c_hi, x)
+    t = np.polyval(t_hi, w)
 
     # Determine K→C offset by checking the polynomial output at the known
     # block endpoints (tmin/tmax are confirmed Celsius).  If the polynomial
     # outputs Kelvin, the endpoint values will be ~273 higher than tmin/tmax.
-    W_lo = float(np.polyval(c_hi, cmin))
-    W_hi = float(np.polyval(c_hi, cmax))
-    T_lo = float(np.polyval(t_hi, W_lo))
-    T_hi = float(np.polyval(t_hi, W_hi))
-    offs = 273.15 if abs(T_lo - 273.15 - tmin) < abs(T_lo - tmin) else 0.0
+    w_lo = float(np.polyval(c_hi, cmin))
+    t_lo = float(np.polyval(t_hi, w_lo))
+    offs = 273.15 if abs(t_lo - 273.15 - tmin) < abs(t_lo - tmin) else 0.0
 
-    return T - offs
+    return t - offs
 
 
 # ---------------------------------------------------------------------------
 # Module-level discover() convenience function
 # ---------------------------------------------------------------------------
 
+
 def discover(
-    interface_ip: Optional[str] = None,
+    interface_ip: str | None = None,
     timeout: float = 2.0,
-) -> List[Dict]:
+) -> list[dict]:
     """Discover GigE Vision cameras on the network.
 
     Args:

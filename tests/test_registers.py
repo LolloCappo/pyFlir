@@ -7,7 +7,7 @@ class TestRegisterAddresses:
     """Verify critical register addresses haven't drifted."""
 
     def test_calibration_registers(self):
-        assert reg.REG_CAL_INDEX     == 0x4E062404
+        assert reg.REG_CAL_INDEX == 0x4E062404
         assert reg.REG_CAL_INDEX_MAX == 0x4E062408
 
     def test_nuc_load_dict_populated(self):
@@ -31,5 +31,5 @@ class TestRegisterAddresses:
     def test_sensor_geometry_constants(self):
         assert hasattr(reg, "SENSOR_WIDTH")
         assert hasattr(reg, "SENSOR_HEIGHT")
-        assert reg.SENSOR_WIDTH  > 0
+        assert reg.SENSOR_WIDTH > 0
         assert reg.SENSOR_HEIGHT > 0

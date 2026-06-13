@@ -30,11 +30,9 @@ import re
 import struct
 import warnings
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 import numpy as np
-
 
 # First 6 bytes of the per-frame sync marker (bytes 6-7 vary as a frame counter)
 _SYNC_PREFIX = bytes([0x14, 0x00, 0xD5, 0x03, 0x34, 0x00])
@@ -44,8 +42,13 @@ _RECORD_HDR = 77
 
 # Fallback resolution candidates when XML dimensions are absent
 _RESOLUTIONS = [
-    (1280, 1024), (640, 512), (640, 480),
-    (384, 288), (320, 256), (320, 240), (160, 120),
+    (1280, 1024),
+    (640, 512),
+    (640, 480),
+    (384, 288),
+    (320, 256),
+    (320, 240),
+    (160, 120),
 ]
 
 
@@ -97,7 +100,7 @@ class ATSMetadata:
     source_unit : str or None
     temperature_type : str or None
     apply_nuc, apply_bp : str or None
-    display_min_C, display_max_C : float or None
+    display_min_c, display_max_c : float or None
     display_mode : str or None
     scale_mode : str or None
     segmentation_enabled : str or None
@@ -108,56 +111,57 @@ class ATSMetadata:
     file_size_bytes: int = 0
 
     # Camera
-    camera_model: Optional[str] = None
-    camera_part:  Optional[str] = None
-    lens:         Optional[str] = None
-    filter:       Optional[str] = None
+    camera_model: str | None = None
+    camera_part: str | None = None
+    lens: str | None = None
+    filter: str | None = None
 
     # Acquisition
-    width:            int = 0
-    height:           int = 0
-    n_frames:         int = 0
+    width: int = 0
+    height: int = 0
+    n_frames: int = 0
     frame_start_byte: int = 0
-    stride_bytes:     int = 0
-    sync_row_bytes:   int = 0
+    stride_bytes: int = 0
+    sync_row_bytes: int = 0
 
     # Scene parameters
-    emissivity:               Optional[float] = None
-    distance:                 Optional[float] = None
-    relative_humidity:        Optional[float] = None
-    reflected_temp:           Optional[float] = None
-    atmosphere_temp:          Optional[float] = None
-    ext_optics_temp:          Optional[float] = None
-    ext_optics_transmission:  Optional[float] = None
+    emissivity: float | None = None
+    distance: float | None = None
+    relative_humidity: float | None = None
+    reflected_temp: float | None = None
+    atmosphere_temp: float | None = None
+    ext_optics_temp: float | None = None
+    ext_optics_transmission: float | None = None
 
     # Calibration ranges
-    range_counts_min:       Optional[float] = None
-    range_counts_max:       Optional[float] = None
-    range_radiance_min:     Optional[float] = None
-    range_radiance_max:     Optional[float] = None
-    range_temperaturec_min: Optional[float] = None
-    range_temperaturec_max: Optional[float] = None
-    range_temperaturek_min: Optional[float] = None
-    range_temperaturek_max: Optional[float] = None
-    range_temperaturef_min: Optional[float] = None
-    range_temperaturef_max: Optional[float] = None
-    range_temperaturer_min: Optional[float] = None
-    range_temperaturer_max: Optional[float] = None
+    range_counts_min: float | None = None
+    range_counts_max: float | None = None
+    range_radiance_min: float | None = None
+    range_radiance_max: float | None = None
+    range_temperaturec_min: float | None = None
+    range_temperaturec_max: float | None = None
+    range_temperaturek_min: float | None = None
+    range_temperaturek_max: float | None = None
+    range_temperaturef_min: float | None = None
+    range_temperaturef_max: float | None = None
+    range_temperaturer_min: float | None = None
+    range_temperaturer_max: float | None = None
 
     # Source / display
-    source_unit:            Optional[str]   = None
-    temperature_type:       Optional[str]   = None
-    apply_nuc:              Optional[str]   = None
-    apply_bp:               Optional[str]   = None
-    display_min_C:          Optional[float] = None
-    display_max_C:          Optional[float] = None
-    display_mode:           Optional[str]   = None
-    scale_mode:             Optional[str]   = None
-    segmentation_enabled:   Optional[str]   = None
+    source_unit: str | None = None
+    temperature_type: str | None = None
+    apply_nuc: str | None = None
+    apply_bp: str | None = None
+    display_min_c: float | None = None
+    display_max_c: float | None = None
+    display_mode: str | None = None
+    scale_mode: str | None = None
+    segmentation_enabled: str | None = None
 
     def as_dict(self) -> dict:
         """Return all metadata as a plain dictionary."""
         import dataclasses
+
         return dataclasses.asdict(self)
 
     def __str__(self) -> str:
@@ -169,9 +173,9 @@ class ATSMetadata:
             f"  Size          : {self.file_size_bytes:,} bytes",
             "",
             f"  Camera model  : {self.camera_model or 'unknown'}",
-            f"  Part / serial : {self.camera_part  or 'unknown'}",
-            f"  Lens          : {self.lens         or 'unknown'}",
-            f"  Filter        : {self.filter       or 'unknown'}",
+            f"  Part / serial : {self.camera_part or 'unknown'}",
+            f"  Lens          : {self.lens or 'unknown'}",
+            f"  Filter        : {self.filter or 'unknown'}",
             "",
             f"  Resolution    : {self.width} × {self.height} px",
             f"  Frames        : {self.n_frames}",
@@ -179,12 +183,12 @@ class ATSMetadata:
         ]
 
         scene = {
-            "emissivity":            self.emissivity,
-            "distance":              self.distance,
-            "relative_humidity":     self.relative_humidity,
-            "reflected_temp":        self.reflected_temp,
-            "atmosphere_temp":       self.atmosphere_temp,
-            "ext_optics_temp":       self.ext_optics_temp,
+            "emissivity": self.emissivity,
+            "distance": self.distance,
+            "relative_humidity": self.relative_humidity,
+            "reflected_temp": self.reflected_temp,
+            "atmosphere_temp": self.atmosphere_temp,
+            "ext_optics_temp": self.ext_optics_temp,
             "ext_optics_transmission": self.ext_optics_transmission,
         }
         scene_lines = [f"    {k:28s}: {v:.6g}" for k, v in scene.items() if v is not None]
@@ -192,28 +196,29 @@ class ATSMetadata:
             lines += ["  Scene parameters:"] + scene_lines + [""]
 
         cal_pairs = [
-            ("counts",   self.range_counts_min,       self.range_counts_max),
-            ("radiance", self.range_radiance_min,     self.range_radiance_max),
-            ("temp_C",   self.range_temperaturec_min, self.range_temperaturec_max),
-            ("temp_K",   self.range_temperaturek_min, self.range_temperaturek_max),
-            ("temp_F",   self.range_temperaturef_min, self.range_temperaturef_max),
-            ("temp_R",   self.range_temperaturer_min, self.range_temperaturer_max),
+            ("counts", self.range_counts_min, self.range_counts_max),
+            ("radiance", self.range_radiance_min, self.range_radiance_max),
+            ("temp_C", self.range_temperaturec_min, self.range_temperaturec_max),
+            ("temp_K", self.range_temperaturek_min, self.range_temperaturek_max),
+            ("temp_F", self.range_temperaturef_min, self.range_temperaturef_max),
+            ("temp_R", self.range_temperaturer_min, self.range_temperaturer_max),
         ]
-        cal_lines = [f"    {lbl:14s}: {lo:.6g} – {hi:.6g}"
-                     for lbl, lo, hi in cal_pairs if lo is not None]
+        cal_lines = [
+            f"    {lbl:14s}: {lo:.6g} – {hi:.6g}" for lbl, lo, hi in cal_pairs if lo is not None
+        ]
         if cal_lines:
             lines += ["  Calibration ranges (from XML):"] + cal_lines + [""]
 
         src = {
-            "source_unit":      self.source_unit,
+            "source_unit": self.source_unit,
             "temperature_type": self.temperature_type,
-            "apply_nuc":        self.apply_nuc,
-            "apply_bp":         self.apply_bp,
+            "apply_nuc": self.apply_nuc,
+            "apply_bp": self.apply_bp,
         }
         src_lines = [f"    {k:28s}: {v}" for k, v in src.items() if v is not None]
-        if self.display_min_C is not None:
+        if self.display_min_c is not None:
             src_lines.append(
-                f"    {'display_window_C':28s}: {self.display_min_C:.2f} – {self.display_max_C:.2f}"
+                f"    {'display_window_C':28s}: {self.display_min_c:.2f} – {self.display_max_c:.2f}"
             )
         if src_lines:
             lines += ["  Source / display:"] + src_lines + [""]
@@ -228,7 +233,7 @@ class ATSMetadata:
         return "\n".join(lines)
 
 
-def _get_xml(buf: bytes) -> Optional[str]:
+def _get_xml(buf: bytes) -> str | None:
     s = buf.find(b"<workspaceFileSettings>")
     if s == -1:
         return None
@@ -250,7 +255,7 @@ def _parse_xml(xml: str) -> dict:
     if root is not None:
         for el in root.iter("roiList"):
             if "imageWidth" in el.attrib:
-                raw["image_width"]  = int(el.attrib["imageWidth"])
+                raw["image_width"] = int(el.attrib["imageWidth"])
                 raw["image_height"] = int(el.attrib["imageHeight"])
         for el in root.iter("segmentationValue"):
             unit = el.attrib.get("unit", "")
@@ -261,13 +266,13 @@ def _parse_xml(xml: str) -> dict:
                 raw[f"range_{k}_max"] = float(hi)
         for el in root.iter("objectParameters"):
             _map = {
-                "emissivity":           "emissivity",
-                "distance":             "distance",
-                "relativeHumidity":     "relative_humidity",
-                "reflectedTemp":        "reflected_temp",
-                "atmosphereTemp":       "atmosphere_temp",
-                "extOpticsTemp":        "ext_optics_temp",
-                "extOpticsTransmission":"ext_optics_transmission",
+                "emissivity": "emissivity",
+                "distance": "distance",
+                "relativeHumidity": "relative_humidity",
+                "reflectedTemp": "reflected_temp",
+                "atmosphereTemp": "atmosphere_temp",
+                "extOpticsTemp": "ext_optics_temp",
+                "extOpticsTransmission": "ext_optics_transmission",
             }
             for xml_key, py_key in _map.items():
                 if xml_key in el.attrib:
@@ -285,8 +290,8 @@ def _parse_xml(xml: str) -> dict:
             raw["display_mode"] = el.attrib.get("mode", "")
             for sub in el.iter("levelAndSpanValue"):
                 if sub.attrib.get("unit") == "TemperatureC":
-                    raw["display_min_C"] = float(sub.attrib.get("min", 0))
-                    raw["display_max_C"] = float(sub.attrib.get("max", 0))
+                    raw["display_min_c"] = float(sub.attrib.get("min", 0))
+                    raw["display_max_c"] = float(sub.attrib.get("max", 0))
         for el in root.iter("scaleOptions"):
             raw["scale_mode"] = el.attrib.get("mode", "")
         for el in root.iter("segmentation"):
@@ -296,7 +301,7 @@ def _parse_xml(xml: str) -> dict:
         mw = re.search(r'imageWidth="(\d+)"', xml)
         mh = re.search(r'imageHeight="(\d+)"', xml)
         if mw and mh:
-            raw["image_width"]  = int(mw.group(1))
+            raw["image_width"] = int(mw.group(1))
             raw["image_height"] = int(mh.group(1))
     return raw
 
@@ -318,7 +323,7 @@ def _parse_source_info(buf: bytes) -> dict:
 
     p = idx + _RECORD_HDR
 
-    def read_nts(offset: int) -> Optional[str]:
+    def read_nts(offset: int) -> str | None:
         end = offset
         while p + end < len(buf) and 32 <= buf[p + end] < 127:
             end += 1
@@ -329,16 +334,16 @@ def _parse_source_info(buf: bytes) -> dict:
 
     out: dict = {
         "camera_model": read_nts(142),
-        "camera_part":  read_nts(190),
-        "lens":         read_nts(206),
-        "filter":       read_nts(270),
+        "camera_part": read_nts(190),
+        "lens": read_nts(206),
+        "filter": read_nts(270),
     }
 
     if p + 84 <= len(buf):
         w = struct.unpack_from("<H", buf, p + 80)[0]
         h = struct.unpack_from("<H", buf, p + 82)[0]
         if w > 0 and h > 0:
-            out["image_width"]  = w
+            out["image_width"] = w
             out["image_height"] = h
 
     return out
@@ -346,17 +351,16 @@ def _parse_source_info(buf: bytes) -> dict:
 
 def _find_sync(buf: bytes, search_limit: int = 50_000) -> int:
     """Return the byte offset of the first frame sync marker, or -1."""
-    _KNOWN_PREFIXES = [
+    known_prefixes = [
         bytes([0x14, 0x00, 0xD5, 0x03, 0x34, 0x00]),  # FLIR A8581
         bytes([0x14, 0x00, 0xD9, 0x04, 0x03, 0x70]),  # FLIR A6751sc
     ]
 
-    for prefix in _KNOWN_PREFIXES:
+    for prefix in known_prefixes:
         idx = buf.find(prefix)
         if 0 <= idx < search_limit:
             return idx
 
-    min_stride = min((h + 1) * w * 2 for w, h in _RESOLUTIONS)
     for offset in range(0, min(search_limit, len(buf) - 6), 2):
         candidate = buf[offset : offset + 6]
         if candidate == bytes(6):
@@ -381,25 +385,37 @@ def _detect_layout(buf: bytes, w: int, h: int) -> tuple:
             "The file may not be a supported ATS-US variant."
         )
 
-    row_bytes   = w * 2
+    row_bytes = w * 2
     image_bytes = w * h * 2
-    expected    = (h + 1) * row_bytes
+    expected = (h + 1) * row_bytes
 
     p1 = f0 + expected + row_bytes
     if p1 + image_bytes <= len(buf):
-        c0 = np.frombuffer(buf[f0 + row_bytes : f0 + row_bytes + image_bytes], dtype="<u2").reshape(h, w)
+        c0 = np.frombuffer(buf[f0 + row_bytes : f0 + row_bytes + image_bytes], dtype="<u2").reshape(
+            h, w
+        )
         c1 = np.frombuffer(buf[p1 : p1 + image_bytes], dtype="<u2").reshape(h, w)
-        mad = float(np.abs(c0[10:-10, 10:-10].astype(np.int32) - c1[10:-10, 10:-10].astype(np.int32)).mean())
+        mad = float(
+            np.abs(c0[10:-10, 10:-10].astype(np.int32) - c1[10:-10, 10:-10].astype(np.int32)).mean()
+        )
         if mad < 2000:
             return f0, expected, row_bytes
 
-    c0 = np.frombuffer(buf[f0 + row_bytes : f0 + row_bytes + image_bytes], dtype="<u2").reshape(h, w)[10:h-10, 10:w-10].astype(np.float32)
+    c0 = (
+        np.frombuffer(buf[f0 + row_bytes : f0 + row_bytes + image_bytes], dtype="<u2")
+        .reshape(h, w)[10 : h - 10, 10 : w - 10]
+        .astype(np.float32)
+    )
     best_mad, best_stride = 1e18, expected
     for stride in range(expected - 5 * row_bytes, expected + 5 * row_bytes + 1, 2):
         p = f0 + stride + row_bytes
         if p + image_bytes > len(buf):
             break
-        c1 = np.frombuffer(buf[p : p + image_bytes], dtype="<u2").reshape(h, w)[10:h-10, 10:w-10].astype(np.float32)
+        c1 = (
+            np.frombuffer(buf[p : p + image_bytes], dtype="<u2")
+            .reshape(h, w)[10 : h - 10, 10 : w - 10]
+            .astype(np.float32)
+        )
         mad = float(np.abs(c0 - c1).mean())
         if mad < best_mad:
             best_mad, best_stride = mad, stride
@@ -437,9 +453,9 @@ class FLIRATSReader:
 
     def __init__(self, filepath: str):
         self.filepath = os.path.abspath(filepath)
-        self.raw:           Optional[np.ndarray] = None
-        self.temperature_C: Optional[np.ndarray] = None
-        self.metadata:      Optional[ATSMetadata] = None
+        self.raw: np.ndarray | None = None
+        self.temperature_C: np.ndarray | None = None
+        self.metadata: ATSMetadata | None = None
 
     def read(self) -> "FLIRATSReader":
         """Parse the file and populate raw, temperature_C, and metadata. Returns self."""
@@ -447,9 +463,7 @@ class FLIRATSReader:
             buf = fh.read()
 
         if not buf[:16].startswith(self.FILE_MAGIC):
-            raise ValueError(
-                f"Not a FLIR ATS-US file (got magic bytes {buf[:16]!r})"
-            )
+            raise ValueError(f"Not a FLIR ATS-US file (got magic bytes {buf[:16]!r})")
 
         meta = ATSMetadata(filepath=self.filepath, file_size_bytes=len(buf))
 
@@ -493,7 +507,9 @@ class FLIRATSReader:
             img_start = f0 + i * stride + row_skip
             if img_start + image_bytes > len(buf):
                 break
-            out[count] = np.frombuffer(buf[img_start : img_start + image_bytes], dtype="<u2").reshape(h, w)
+            out[count] = np.frombuffer(
+                buf[img_start : img_start + image_bytes], dtype="<u2"
+            ).reshape(h, w)
             count += 1
 
         if count == 0:
@@ -502,12 +518,12 @@ class FLIRATSReader:
         self.raw = out[:count]
         self.temperature_C = self._compute_celsius(meta)
 
-        meta.width            = w
-        meta.height           = h
-        meta.n_frames         = count
+        meta.width = w
+        meta.height = h
+        meta.n_frames = count
         meta.frame_start_byte = f0
-        meta.stride_bytes     = stride
-        meta.sync_row_bytes   = row_skip
+        meta.stride_bytes = stride
+        meta.sync_row_bytes = row_skip
         self.metadata = meta
 
         return self
@@ -515,9 +531,7 @@ class FLIRATSReader:
     def get_temperature(self, unit: str = "C") -> np.ndarray:
         """Return temperature array in the requested unit (C, K, or F)."""
         if self.temperature_C is None:
-            raise RuntimeError(
-                "No calibration data found in file; cannot convert to temperature."
-            )
+            raise RuntimeError("No calibration data found in file; cannot convert to temperature.")
         u = unit.upper()
         if u == "C":
             return self.temperature_C
@@ -527,34 +541,35 @@ class FLIRATSReader:
             return self.temperature_C * 9.0 / 5.0 + 32.0
         raise ValueError(f"Unknown unit '{unit}'. Use 'C', 'K', or 'F'.")
 
-    def export_csv(self, idx: int = 0, unit: str = "C",
-                   path: Optional[str] = None) -> str:
+    def export_csv(self, idx: int = 0, unit: str = "C", path: str | None = None) -> str:
         """Save one frame as a CSV file. Returns the output path."""
         self._check_read()
-        arr = (self.raw[idx].astype(float) if unit.upper() == "COUNTS"
-               else self.get_temperature(unit)[idx])
+        arr = (
+            self.raw[idx].astype(float)
+            if unit.upper() == "COUNTS"
+            else self.get_temperature(unit)[idx]
+        )
         path = path or f"frame_{idx:04d}_{unit.upper()}.csv"
         np.savetxt(path, arr, delimiter=",", fmt="%.4f")
         return path
 
-    def export_npy(self, path: Optional[str] = None) -> str:
+    def export_npy(self, path: str | None = None) -> str:
         """Save all raw uint16 frames as a .npy file. Returns the output path."""
         self._check_read()
         path = path or os.path.splitext(self.filepath)[0] + "_raw.npy"
         np.save(path, self.raw)
         return path
 
-    def export_tiff(self, unit: str = "C", path: Optional[str] = None) -> str:
+    def export_tiff(self, unit: str = "C", path: str | None = None) -> str:
         """Save all frames as a multi-page float32 TIFF. Requires tifffile."""
         try:
             import tifffile
         except ImportError as exc:
-            raise ImportError(
-                "tifffile is required for TIFF export: pip install tifffile"
-            ) from exc
+            raise ImportError("tifffile is required for TIFF export: pip install tifffile") from exc
         self._check_read()
-        arr = (self.raw.astype(np.float32) if unit.upper() == "COUNTS"
-               else self.get_temperature(unit))
+        arr = (
+            self.raw.astype(np.float32) if unit.upper() == "COUNTS" else self.get_temperature(unit)
+        )
         path = path or os.path.splitext(self.filepath)[0] + f"_{unit.upper()}.tiff"
         tifffile.imwrite(path, arr, photometric="minisblack")
         return path
@@ -563,7 +578,7 @@ class FLIRATSReader:
         if self.raw is None:
             raise RuntimeError("Call read() before exporting.")
 
-    def _compute_celsius(self, meta: ATSMetadata) -> Optional[np.ndarray]:
+    def _compute_celsius(self, meta: ATSMetadata) -> np.ndarray | None:
         lo_c = meta.range_temperaturec_min
         hi_c = meta.range_temperaturec_max
         lo_k = meta.range_counts_min
@@ -601,6 +616,7 @@ def read_ats(filepath: str) -> tuple:
 
 # ── SFMOV reader (optional; requires pysfmov) ────────────────────────────────
 
+
 def read_sfmov(filepath: str):
     """Read a FLIR SFMOV sequence file (.sfmov).
 
@@ -608,11 +624,10 @@ def read_sfmov(filepath: str):
     """
     try:
         import pysfmov
-    except ImportError:
+    except ImportError as err:
         raise ImportError(
-            "pysfmov is required to read .sfmov files.\n"
-            "Install it with:  pip install pyflir[io]"
-        )
+            "pysfmov is required to read .sfmov files.\nInstall it with:  pip install pyflir[io]"
+        ) from err
     return pysfmov.get_data(filepath)
 
 
@@ -623,11 +638,10 @@ def read_sfmov_meta(filepath: str) -> dict:
     """
     try:
         import pysfmov
-    except ImportError:
+    except ImportError as err:
         raise ImportError(
-            "pysfmov is required to read .sfmov files.\n"
-            "Install it with:  pip install pyflir[io]"
-        )
+            "pysfmov is required to read .sfmov files.\nInstall it with:  pip install pyflir[io]"
+        ) from err
     return pysfmov.get_meta_data(filepath)
 
 

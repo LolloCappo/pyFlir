@@ -7,7 +7,6 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
-from pyGigEVision import GVCPError
 
 from pyflir.camera import Camera, CameraError, discover
 
@@ -21,9 +20,9 @@ def _make_fake_connected_camera():
     cam._gvsp.get_frame.return_value = None
     cam._gvsp.port = 3957
     cam._gvsp._sock.getsockname.return_value = ("169.254.1.1", 3957)
-    cam.width  = 320
+    cam.width = 320
     cam.height = 256
-    cam.ip     = "169.254.1.1"
+    cam.ip = "169.254.1.1"
     return cam
 
 
@@ -66,9 +65,13 @@ class TestStreamingAPI:
         cam._gvsp.get_frame.return_value = frame
         cam._streaming = True
 
-        with patch.object(cam, "start_stream", side_effect=lambda **kw: setattr(cam, "_streaming", True)):
-            with patch.object(cam, "stop_stream", side_effect=lambda: setattr(cam, "_streaming", False)):
-                result = cam.grab(timeout=1.0)
+        with (
+            patch.object(
+                cam, "start_stream", side_effect=lambda **kw: setattr(cam, "_streaming", True)
+            ),
+            patch.object(cam, "stop_stream", side_effect=lambda: setattr(cam, "_streaming", False)),
+        ):
+            result = cam.grab(timeout=1.0)
 
         assert result is not None
         assert result.shape == (256, 320)
@@ -102,7 +105,7 @@ class TestStreamingAPI:
 
     def test_start_stream_requires_xml(self):
         cam = _make_fake_connected_camera()
-        cam.width  = None
+        cam.width = None
         cam.height = None
         with pytest.raises(CameraError, match="[Ll]oad_xml|[Dd]imensions"):
             cam.start_stream()
@@ -135,11 +138,13 @@ class TestPropertiesWithMock:
     def test_frame_rate_setter_raises_above_max(self):
         cam = _make_fake_connected_camera()
 
-        with patch.object(cam, "get_max_frame_rate", return_value=50.0):
-            with patch.object(cam, "write_float") as mock_write:
-                with pytest.raises(CameraError, match="[Mm]ax|[Ee]xceeds"):
-                    cam.frame_rate = 200.0
-                mock_write.assert_not_called()
+        with (
+            patch.object(cam, "get_max_frame_rate", return_value=50.0),
+            patch.object(cam, "write_float") as mock_write,
+            pytest.raises(CameraError, match="[Mm]ax|[Ee]xceeds"),
+        ):
+            cam.frame_rate = 200.0
+        mock_write.assert_not_called()
 
     def test_exposure_ms_property_conversion(self):
         cam = _make_fake_connected_camera()

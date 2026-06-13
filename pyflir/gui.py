@@ -17,6 +17,7 @@ Features:
   - Min/Max/Mean stats in status bar
 """
 
+import contextlib
 import time
 from typing import TYPE_CHECKING
 
@@ -28,8 +29,10 @@ if TYPE_CHECKING:
 try:
     import tkinter as tk
     from tkinter import ttk
-    from PIL import Image, ImageTk, ImageDraw
+
     import matplotlib
+    from PIL import Image, ImageDraw, ImageTk
+
     HAS_GUI_DEPS = True
 except ImportError:
     HAS_GUI_DEPS = False
@@ -41,10 +44,7 @@ COLORBAR_WIDTH = 60
 
 def _check_gui_deps():
     if not HAS_GUI_DEPS:
-        raise ImportError(
-            "GUI dependencies not installed. Run:\n"
-            "  pip install pyflir[gui]"
-        )
+        raise ImportError("GUI dependencies not installed. Run:\n  pip install pyflir[gui]")
 
 
 def build_lut(cmap_name: str) -> np.ndarray:
@@ -67,22 +67,19 @@ class LiveView:
         scale: Display upscale factor (1 = native resolution).
     """
 
-    def __init__(self, camera: "Camera", colormap: str = "inferno",
-                 scale: int = 2):
+    def __init__(self, camera: "Camera", colormap: str = "inferno", scale: int = 2):
         _check_gui_deps()
 
         self.cam = camera
-        self.width  = camera.width  or 0
+        self.width = camera.width or 0
         self.height = camera.height or 0
         if self.width == 0 or self.height == 0:
-            raise RuntimeError(
-                "Image dimensions unknown; call cam.load_xml() before live_view()."
-            )
+            raise RuntimeError("Image dimensions unknown; call cam.load_xml() before live_view().")
 
         self.cmap_name = colormap
         self.lut = build_lut(self.cmap_name)
         self.scale = scale
-        self.disp_w = self.width  * scale
+        self.disp_w = self.width * scale
         self.disp_h = self.height * scale
 
         # Current frame for cursor readout
@@ -109,12 +106,10 @@ class LiveView:
         main = tk.Frame(self.root)
         main.pack(fill="both", expand=True)
 
-        self.canvas = tk.Canvas(main, width=self.disp_w,
-                                height=self.disp_h, bg="black")
+        self.canvas = tk.Canvas(main, width=self.disp_w, height=self.disp_h, bg="black")
         self.canvas.pack(side="left")
 
-        self.cbar_canvas = tk.Canvas(main, width=COLORBAR_WIDTH,
-                                     height=self.disp_h, bg="black")
+        self.cbar_canvas = tk.Canvas(main, width=COLORBAR_WIDTH, height=self.disp_h, bg="black")
         self.cbar_canvas.pack(side="left", fill="y")
 
         # Bottom bar: status + controls
@@ -122,24 +117,31 @@ class LiveView:
         bottom.pack(fill="x", padx=5, pady=2)
 
         self.status_var = tk.StringVar(value="Starting…")
-        self.status = tk.Label(bottom, textvariable=self.status_var,
-                               font=("Consolas", 10), anchor="w")
+        self.status = tk.Label(
+            bottom, textvariable=self.status_var, font=("Consolas", 10), anchor="w"
+        )
         self.status.pack(side="left", fill="x", expand=True)
 
         self.cursor_var = tk.StringVar(value="")
-        self.cursor_label = tk.Label(bottom, textvariable=self.cursor_var,
-                                     font=("Consolas", 10), anchor="e",
-                                     fg="yellow", bg="black", padx=5)
+        self.cursor_label = tk.Label(
+            bottom,
+            textvariable=self.cursor_var,
+            font=("Consolas", 10),
+            anchor="e",
+            fg="yellow",
+            bg="black",
+            padx=5,
+        )
         self.cursor_label.pack(side="right")
 
         self.cmap_var = tk.StringVar(value=self.cmap_name)
-        cmap_menu = ttk.Combobox(bottom, textvariable=self.cmap_var,
-                                 values=COLORMAP_CHOICES, width=10,
-                                 state="readonly")
+        cmap_menu = ttk.Combobox(
+            bottom, textvariable=self.cmap_var, values=COLORMAP_CHOICES, width=10, state="readonly"
+        )
         cmap_menu.pack(side="right")
         cmap_menu.bind("<<ComboboxSelected>>", self._on_cmap_change)
 
-        self.canvas.bind("<Motion>",   self._on_mouse_move)
+        self.canvas.bind("<Motion>", self._on_mouse_move)
         self.canvas.bind("<Button-1>", self._on_click)
         self.canvas.bind("<Button-3>", self._on_right_click)
 
@@ -175,9 +177,11 @@ class LiveView:
 
     def _dn_at(self, ix: int, iy: int):
         """Return the raw DN value at image coordinates, or None."""
-        if (self._current_frame is not None
-                and 0 <= iy < self._current_frame.shape[0]
-                and 0 <= ix < self._current_frame.shape[1]):
+        if (
+            self._current_frame is not None
+            and 0 <= iy < self._current_frame.shape[0]
+            and 0 <= ix < self._current_frame.shape[1]
+        ):
             return int(self._current_frame[iy, ix])
         return None
 
@@ -191,10 +195,8 @@ class LiveView:
 
         # Pull latest frame (non-blocking drain → freshest image)
         frame = None
-        try:
+        with contextlib.suppress(Exception):
             frame = self.cam.read(timeout=0.05, latest=True)
-        except Exception:
-            pass
 
         if frame is not None and frame.size > 0:
             self._current_frame = frame.astype(np.float32)
@@ -222,8 +224,7 @@ class LiveView:
                 for mx, my in self._markers:
                     dx, dy = mx * self.scale, my * self.scale
                     r = 4
-                    draw.ellipse([dx - r, dy - r, dx + r, dy + r],
-                                 outline="white", width=2)
+                    draw.ellipse([dx - r, dy - r, dx + r, dy + r], outline="white", width=2)
                     dn = self._dn_at(mx, my)
                     if dn is not None:
                         draw.text((dx + r + 2, dy - 8), str(dn), fill="white")
@@ -252,9 +253,7 @@ class LiveView:
 
             dn = self._dn_at(self._mouse_img_x, self._mouse_img_y)
             if dn is not None:
-                self.cursor_var.set(
-                    f"({self._mouse_img_x},{self._mouse_img_y})  {dn} DN"
-                )
+                self.cursor_var.set(f"({self._mouse_img_x},{self._mouse_img_y})  {dn} DN")
             else:
                 self.cursor_var.set("")
 
