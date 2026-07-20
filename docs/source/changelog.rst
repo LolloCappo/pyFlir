@@ -1,8 +1,8 @@
 Changelog
 =========
 
-Unreleased
-----------
+Version 0.2.1
+-------------
 
 - **Radiometry root-cause fix (live A6751sc).** Temperatures read far too hot
   (a room scene pinned near 79 °C) because *no factory calibration was loaded*
