@@ -14,6 +14,20 @@ class TestRegisterAddresses:
         assert isinstance(reg.REG_NUC_LOAD, dict)
         assert len(reg.REG_NUC_LOAD) > 0
 
+    def test_calibration_load_dicts(self):
+        # One entry per preset (0-3), addresses distinct.
+        for d in (
+            reg.REG_PS_CALIBRATION_TAG,
+            reg.REG_PS_CALIBRATION_LOAD_TAG,
+            reg.REG_PS_CALIBRATION_LOAD,
+        ):
+            assert set(d.keys()) == {0, 1, 2, 3}
+            assert len(set(d.values())) == 4
+        assert reg.REG_PS_CALIBRATION_TAG[0] == 0x4E059DE0
+        assert reg.REG_PS_CALIBRATION_LOAD_TAG[0] == 0x4E05A1E0
+        assert reg.REG_PS_CALIBRATION_LOAD[0] == 0x4E05A5E0
+        assert reg.REG_ACTIVE_PRESET == 0x4E05882C
+
     def test_roi_registers_exist(self):
         assert hasattr(reg, "REG_OFFSET_X")
         assert hasattr(reg, "REG_OFFSET_Y")

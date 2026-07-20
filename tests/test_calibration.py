@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from pyflir.camera import apply_calibration
+from pyflir.camera import STATUS_OK, STATUS_OVERFLOW, STATUS_UNDERFLOW, apply_calibration
 
 
 def _make_cal(
@@ -144,3 +144,112 @@ class TestApplyCalibrationEdgeCases:
         result = apply_calibration(raw, cal)
         assert result is not None
         assert np.isfinite(result).all()
+
+
+class TestApplyCalibrationBackground:
+    """counts_background must be subtracted in the counts -> radiance step."""
+
+    def test_background_subtraction_exact(self):
+        # Linear cal: W = x / counts_max, T = tmin + (tmax - tmin) * W.
+        # Subtracting `background` from W shifts T by -background * (tmax - tmin).
+        raw = np.array([[8192 * 4]], dtype=np.uint16)
+        cal_ref = _make_cal(counts_background=0.0)
+        cal_bg = _make_cal(counts_background=0.1)
+        result_ref = apply_calibration(raw, cal_ref)
+        result_bg = apply_calibration(raw, cal_bg)
+        expected_shift = 0.1 * 75.0  # 0.1 * (tmax - tmin)
+        assert abs((float(result_ref[0, 0]) - float(result_bg[0, 0])) - expected_shift) < 1e-6
+
+    def test_zero_background_is_unaffected(self):
+        raw = np.array([[8192 * 4]], dtype=np.uint16)
+        cal = _make_cal(counts_background=0.0)
+        result = apply_calibration(raw, cal)
+        assert abs(float(result[0, 0]) - 17.5) < 0.2
+
+
+class TestApplyCalibrationClipAndStatus:
+    """Out-of-range counts must clip to the calibrated domain and flag status."""
+
+    def test_in_range_status_ok(self):
+        cal = _make_cal()
+        raw = np.array([[8192 * 4]], dtype=np.uint16)
+        _, status = apply_calibration(raw, cal, return_status=True)
+        assert status[0, 0] == STATUS_OK
+
+    def test_underflow_clips_and_flags(self):
+        cal = _make_cal(counts_min=1000.0, counts_max=16383.0)
+        raw_below = np.array([[500 * 4]], dtype=np.uint16)
+        raw_at_min = np.array([[1000 * 4]], dtype=np.uint16)
+        temp_below, status = apply_calibration(raw_below, cal, return_status=True)
+        temp_at_min = apply_calibration(raw_at_min, cal)
+        assert status[0, 0] == STATUS_UNDERFLOW
+        assert abs(float(temp_below[0, 0]) - float(temp_at_min[0, 0])) < 1e-9
+
+    def test_overflow_clips_and_flags(self):
+        cal = _make_cal(counts_min=0.0, counts_max=10000.0)
+        raw_above = np.array([[15000 * 4]], dtype=np.uint16)
+        raw_at_max = np.array([[10000 * 4]], dtype=np.uint16)
+        temp_above, status = apply_calibration(raw_above, cal, return_status=True)
+        temp_at_max = apply_calibration(raw_at_max, cal)
+        assert status[0, 0] == STATUS_OVERFLOW
+        assert abs(float(temp_above[0, 0]) - float(temp_at_max[0, 0])) < 1e-9
+
+    def test_return_status_false_returns_plain_array_not_tuple(self):
+        cal = _make_cal()
+        raw = np.zeros((4, 4), dtype=np.uint16)
+        result = apply_calibration(raw, cal)
+        assert isinstance(result, np.ndarray)
+
+    def test_return_status_true_returns_tuple_with_matching_shape(self):
+        cal = _make_cal()
+        raw = np.zeros((4, 4), dtype=np.uint16)
+        temp, status = apply_calibration(raw, cal, return_status=True)
+        assert temp.shape == status.shape == (4, 4)
+        assert status.dtype == np.uint8
+
+
+class TestApplyCalibrationObjectParameters:
+    """Emissivity/atmosphere/reflected-temperature compensation."""
+
+    def test_default_params_unchanged_from_no_correction(self):
+        cal = _make_cal()
+        raw = np.array([[8192 * 4]], dtype=np.uint16)
+        result_default = apply_calibration(raw, cal)
+        result_explicit = apply_calibration(raw, cal, emissivity=1.0, tau=1.0)
+        assert abs(float(result_default[0, 0]) - float(result_explicit[0, 0])) < 1e-9
+
+    def test_reflected_temp_only_matters_when_emissivity_below_one(self):
+        cal = _make_cal()
+        raw = np.array([[8192 * 4]], dtype=np.uint16)
+        r_cold = apply_calibration(raw, cal, emissivity=0.9, tau=1.0, refl_temp_c=0.0)
+        r_hot = apply_calibration(raw, cal, emissivity=0.9, tau=1.0, refl_temp_c=50.0)
+        assert not np.isclose(float(r_cold[0, 0]), float(r_hot[0, 0]))
+
+    def test_atm_temp_only_matters_when_tau_below_one(self):
+        cal = _make_cal()
+        raw = np.array([[8192 * 4]], dtype=np.uint16)
+        r_cold = apply_calibration(raw, cal, emissivity=1.0, tau=0.9, atm_temp_c=0.0)
+        r_hot = apply_calibration(raw, cal, emissivity=1.0, tau=0.9, atm_temp_c=50.0)
+        assert not np.isclose(float(r_cold[0, 0]), float(r_hot[0, 0]))
+
+    def test_object_signal_formula_exact(self):
+        # Linear cal: W_total = x / counts_max, T(W) = tmin + (tmax - tmin) * W.
+        # Verify apply_calibration's arithmetic matches the documented
+        # object-signal equation exactly, not just "changes with params".
+        tmin, tmax, counts_max = -20.0, 55.0, 16383.0
+        cal = _make_cal(tmin=tmin, tmax=tmax, counts_min=0.0, counts_max=counts_max)
+        raw_14bit = 8192
+        raw = np.array([[raw_14bit * 4]], dtype=np.uint16)
+        emissivity, tau = 0.9, 0.95
+        refl_temp_c, atm_temp_c = 20.0, 15.0
+
+        w_total = raw_14bit / counts_max
+        w_refl = (refl_temp_c - tmin) / (tmax - tmin)
+        w_atm = (atm_temp_c - tmin) / (tmax - tmin)
+        w_obj = (w_total - (1 - emissivity) * tau * w_refl - (1 - tau) * w_atm) / (emissivity * tau)
+        expected_t = tmin + (tmax - tmin) * w_obj
+
+        result = apply_calibration(
+            raw, cal, emissivity=emissivity, refl_temp_c=refl_temp_c, atm_temp_c=atm_temp_c, tau=tau
+        )
+        assert abs(float(result[0, 0]) - expected_t) < 1e-6

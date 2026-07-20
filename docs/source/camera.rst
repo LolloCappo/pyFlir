@@ -15,6 +15,17 @@ Module-level helpers
 
 .. autofunction:: force_ip
 
+Radiometric conversion
+-----------------------
+
+.. autofunction:: apply_calibration
+
+.. py:data:: STATUS_OK
+.. py:data:: STATUS_UNDERFLOW
+.. py:data:: STATUS_OVERFLOW
+
+   Per-pixel status codes returned by ``apply_calibration(..., return_status=True)``.
+
 Connection diagnostics
 ----------------------
 

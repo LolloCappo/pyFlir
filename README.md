@@ -24,10 +24,11 @@ Supported cameras:
   no hardcoded register maps for standard features
 - **Live streaming**: real-time frame acquisition, `read(latest=True)` for lag-free display
 - **ROI / subwindow**: configurable resolution for higher frame rates
-- **Calibration blocks**: list and select temperature-range calibration presets
+- **Calibration blocks**: list and load temperature-range calibrations (sets the
+  matching integration time, like the vendor software)
 - **Radiometry**: emissivity, distance, atmospheric temperature, humidity
 - **Temperature sensors**: read all on-board thermistors
-- **NUC**: trigger non-uniformity correction, flag-in-FOV / stow
+- **NUC**: perform a fresh non-uniformity correction, flag-in-FOV / stow
 - **File I/O**: read FLIR ATS and SFMOV recorded files
 
 ## Installation
@@ -47,8 +48,8 @@ from pyflir import Camera
 with Camera() as cam:
     cam.download_xml()                             # once; saves camera_<serial>.xml
     cam.load_xml("camera_xxx.xml")
+    cam.load_calibration(index=0)                  # select range; sets integration time
     cam.frame_rate  = 30.0                         # Hz
-    cam.exposure_ms = 8.0                          # ms
 
     frame = cam.grab()                             # single frame -> numpy (H, W), uint16
     frames = cam.acquire(10)                       # 10 frames -> list of (H, W)
@@ -79,10 +80,16 @@ with Camera() as cam:              # or Camera(ip="169.254.1.10")
 
 ```python
 cam.frame_rate   = 30.0            # Hz
-cam.exposure_ms  = 8.0             # milliseconds
+cam.exposure_ms                    # integration time in ms (read-only in practice;
+                                   # set by load_calibration(), not independently)
 cam.frame_rate_max                 # max Hz for current ROI (read-only)
 cam.detector_temperature           # FPA temperature in °C (read-only)
 ```
+
+> **Integration time is coupled to the calibration.** Each factory calibration
+> is fit at a specific integration time; `load_calibration()` sets it for you.
+> Setting `cam.exposure_ms` yourself desyncs the raw counts from the calibration
+> polynomial (temperatures read wrong) and emits a warning. See below.
 
 ## GenICam feature access
 
@@ -98,13 +105,25 @@ cam.execute_command("AcquisitionStart")
 
 ## Calibration blocks (temperature range selection)
 
+Each factory calibration covers a temperature range **and is fit at one
+specific integration time**. Loading a calibration sets both together — you do
+not (and must not) set integration time independently of the calibration.
+
 ```python
 for b in cam.get_calibration_blocks():
-    print(b["index"], b.get("name"), b["tmin"], "–", b["tmax"], "°C")
+    print(b["index"], b.get("name"), b["tmin"], "–", b["tmax"], "°C", b["lens"])
 
-cam.set_calibration_block(0)       # select first (coldest) range
-cam.trigger_nuc()                  # trigger non-uniformity correction
+# Load a range into the active preset. This changes the live stream AND sets
+# the integration time the calibration was fit at (e.g. 2.35 ms for -20–55 °C).
+cam.load_calibration(index=0)                       # by browse index, or:
+cam.load_calibration(tag="25mm, Empty, -20C - 55C") # by exact tag
+
+print(cam.get_calibration_block())   # index actually applied to the stream
 ```
+
+> **Note** After loading a calibration, the image may show fixed-pattern noise
+> if the stored NUC is stale for the new integration time. Run `cam.perform_nuc()`
+> to compute a fresh correction (see below).
 
 ## Radiometry
 
@@ -117,6 +136,12 @@ cam.set_object_params(
     humidity    = 0.50,
 )
 print(cam.get_object_params())
+
+frame = cam.grab()
+temp  = cam.counts_to_temperature(frame)   # °C, uses the object params above
+
+# Per-pixel validity (out-of-range counts get clipped, not silently extrapolated)
+temp, status = cam.counts_to_temperature(frame, return_status=True)
 ```
 
 ## ROI / subwindow
@@ -137,9 +162,28 @@ for name, celsius in cam.get_temperatures().items():
 ## NUC and flag
 
 ```python
-cam.flag_move_in_fov()             # move flag in front of detector
-cam.trigger_nuc()
-cam.flag_move_stowed()             # stow flag, resume imaging
+cam.perform_nuc()                  # compute a fresh correction now
+                                    # (blocks until done; uses the internal
+                                    # flag automatically, no user action needed)
+
+print(cam.get_nuc_status())        # {"name": "..."} -- what's currently loaded
+print(cam.has_flag())              # does this camera have a physical flag?
+print(cam.get_flag_state())        # "Stowed" or "InFOV"
+```
+
+For a two-point correction or an external blackbody target (needs a person
+to present it and confirm), drive the state machine directly instead of
+`perform_nuc()`:
+
+```python
+cam.correction_start(correction_type="TwoPoint", source="External")
+# ... present the first uniform target, then:
+cam.correction_continue()
+# ... present the second uniform target, then:
+cam.correction_continue()
+print(cam.get_correction_status())
+print(cam.get_correction_result())
+cam.correction_accept()            # or correction_discard() / correction_abort()
 ```
 
 ## Live streaming

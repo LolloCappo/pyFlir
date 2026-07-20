@@ -21,3 +21,6 @@ htmlcov/
 
 # GenICam XML files downloaded from cameras
 camera_*.xml
+
+# Sphinx build output
+docs/_build/

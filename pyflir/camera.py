@@ -23,6 +23,7 @@ import logging
 import socket
 import struct
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -58,8 +59,18 @@ _SFNC_CANDIDATES = {
         "FrameRateReg",
         "SuperframeRateReg",
     ],
-    "AcquisitionFrameRateMax": ["PS0FrameRateMax", "AcquisitionFrameRateMax", "FrameRateMax"],
-    "DeviceTemperature": ["DeviceTemperature", "FPAColdReg", "FPATemperatureReg"],
+    "AcquisitionFrameRateMax": [
+        "AcquisitionFrameRateMax",
+        "PS0FrameRateMaxReg",
+        "FrameRateMaxReg",
+    ],
+    # No FLIR-specific fallback here: "FPAColdReg" looks like a temperature
+    # register by name but actually backs a Boolean status flag ("FPACold"),
+    # not a Float feature -- reading it with read_float() silently
+    # reinterprets a 0/1 integer as an IEEE-754 float. detector_temperature
+    # uses the selector-based get_temperatures()["FPA"] instead, which reads
+    # the real live FPA sensor correctly on every camera tested so far.
+    "DeviceTemperature": ["DeviceTemperature"],
     "Emissivity": ["ObjectEmissivityReg"],
     "ObjectDistance": ["ObjectDistanceReg"],
     "AtmosphericTemperature": ["AtmosphericTemperatureReg"],
@@ -71,6 +82,73 @@ _SFNC_CANDIDATES = {
 
 class CameraError(Exception):
     """Raised for high-level camera operation failures."""
+
+
+def _find_matching_interface(camera_ip: str, timeout: float = 1.0) -> str:
+    """Return the local interface that can actually reach *camera_ip*.
+
+    ``GVCPClient.discover()`` sweeps every local interface internally and
+    returns one deduped entry per camera IP, picking whichever socket's
+    reply arrived first. That is not necessarily the interface on the
+    camera's own subnet: GVCP control replies go straight back to the
+    request's source address regardless of subnet match, so a host with
+    several interfaces (VPN, secondary NIC, stale static IP left on the
+    camera's adapter) can have its discovery reply "won" by the wrong one.
+    GVSP streaming, which the camera itself originates, then silently fails
+    since it has no real route to that address.
+
+    Re-derives the correct interface by querying each local interface
+    individually via ``discover(interface_ip=...)`` (a single socket bound
+    to one address -- no cross-interface race to get wrong), preferring
+    same-subnet candidates so the common case resolves in one round trip.
+
+    Parameters
+    ----------
+    camera_ip : str
+        IPv4 address of the camera to find a route to.
+    timeout : float, optional
+        Seconds to wait for each per-interface discovery attempt.
+
+    Returns
+    -------
+    str
+        The local interface IP that got a reply from *camera_ip*, or ``""``
+        if none did (falls back to OS routing via :meth:`Camera._local_ip`).
+    """
+    import ipaddress
+
+    import psutil
+
+    candidates: list[tuple[str, str | None]] = []
+    stats = psutil.net_if_stats()
+    for name, addrs in psutil.net_if_addrs().items():
+        st = stats.get(name)
+        if st is None or not st.isup:
+            continue
+        for a in addrs:
+            if a.family == socket.AF_INET and a.address and not a.address.startswith("127."):
+                candidates.append((a.address, a.netmask))
+
+    def _same_subnet(ip: str, netmask: str | None) -> bool:
+        if not netmask:
+            return False
+        try:
+            return ipaddress.IPv4Address(camera_ip) in ipaddress.IPv4Network(
+                f"{ip}/{netmask}", strict=False
+            )
+        except ValueError:
+            return False
+
+    candidates.sort(key=lambda c: not _same_subnet(*c))
+
+    for ip, _netmask in candidates:
+        try:
+            found = GVCPClient.discover(interface_ip=ip, timeout=timeout)
+        except Exception:
+            continue
+        if any(info.get("ip") == camera_ip for info in found):
+            return ip
+    return ""
 
 
 class Camera:
@@ -157,7 +235,7 @@ class Camera:
             fps = _s(lambda: f"{self.read_float('AcquisitionFrameRate'):.1f} Hz")
             fmax = _s(lambda: f"{self.get_max_frame_rate():.1f} Hz")
             exp = _s(lambda: f"{self.read_float('ExposureTime') * 1e3:.3f} ms")
-            temp = _s(lambda: f"{self.read_float('DeviceTemperature'):.1f} °C")
+            temp = _s(lambda: f"{self.detector_temperature:.1f} °C")
             cal = _s(lambda: self._gvcp.read_reg(reg.REG_CAL_INDEX))
             lines.append(f"  ROI       : {w} × {h} px")
             lines.append(f"  frame rate: {fps}  (max {fmax})")
@@ -201,10 +279,6 @@ class Camera:
             self.ip = cam_info["ip"]
             self.serial = cam_info.get("serial", "")
             self.model = cam_info.get("model", "")
-            if not self.interface_ip:
-                # Reuse the NIC that received the discovery reply for
-                # control and streaming.
-                self.interface_ip = cam_info.get("interface_ip", "")
             logger.info(
                 "Found: %s %s  serial=%s  at %s",
                 cam_info.get("manufacturer", ""),
@@ -214,18 +288,18 @@ class Camera:
             )
 
         if not self.interface_ip:
-            # Camera given by explicit IP: sweep all interfaces and bind the
-            # one whose discovery reply matches. OS routing can pick the
-            # wrong NIC for link-local cameras on hosts with several
-            # adapters (VPNs, secondary NICs). _local_ip() stays as the
-            # fallback for cameras on routed subnets the sweep cannot see.
-            try:
-                for info in GVCPClient.discover(timeout=self._timeout):
-                    if info.get("ip") == self.ip:
-                        self.interface_ip = info.get("interface_ip") or ""
-                        break
-            except Exception:
-                pass
+            # Don't trust discover()'s own interface_ip field here: it
+            # dedupes multiple replies for the same camera down to one
+            # entry by whichever local socket answered first, which is not
+            # necessarily the interface actually on the camera's subnet
+            # (GVCP control replies reach the request's source address
+            # regardless of subnet match; only GVSP streaming, which the
+            # camera itself originates, needs a real route). Re-derive it
+            # by querying each local interface individually. _local_ip()
+            # stays as the fallback for cameras on routed subnets this
+            # can't see.
+            with contextlib.suppress(Exception):
+                self.interface_ip = _find_matching_interface(self.ip, timeout=self._timeout)
 
         import time as _time
 
@@ -648,29 +722,74 @@ class Camera:
 
     @property
     def exposure_ms(self) -> float:
-        """Integration time in milliseconds."""
-        return self.read_float("ExposureTime") * 1e3
+        """Integration time in milliseconds.
+
+        The backing register on this camera family is ``PS{n}IntegrationTime``,
+        which the camera's GenICam XML documents directly *in milliseconds*
+        (``IntegrationTimeMax`` reads 687000 -- sensible as ms, absurd as
+        seconds), NOT the SFNC-standard microseconds. So this property is a
+        1:1 passthrough of the register value; no unit scaling is applied.
+
+        On this camera family the active preset's integration time is coupled
+        to its loaded factory calibration: each calibration polynomial is fit
+        at one specific integration time. The camera boots with the two in
+        sync. Changing the integration time away from that value (via the
+        setter) desyncs the raw counts from the calibration and makes
+        :meth:`counts_to_temperature` read wrong -- see the setter's warning.
+        """
+        return self.read_float("ExposureTime")
 
     @exposure_ms.setter
     def exposure_ms(self, ms: float) -> None:
-        self.write_float("ExposureTime", ms / 1e3)
+        warnings.warn(
+            "Setting exposure_ms changes only the integration time, not the "
+            "loaded factory calibration -- and each calibration is fit at one "
+            "specific integration time. Changing it away from the value the "
+            "camera booted with will desync raw counts from the calibration "
+            "polynomial and make counts_to_temperature() read wrong. Leave "
+            "integration time at its boot value unless you also load a matching "
+            "calibration. See get_calibration().",
+            stacklevel=2,
+        )
+        # Register is in milliseconds (see the getter's docstring), so write
+        # the value straight through -- no seconds->ms scaling.
+        self.write_float("ExposureTime", ms)
 
     @property
     def detector_temperature(self) -> float:
-        """Detector (FPA) temperature in degrees Celsius."""
-        return self.read_float("DeviceTemperature")
+        """Detector (FPA) temperature in degrees Celsius.
+
+        Reads via the selector-based on-board sensor mechanism
+        (:meth:`_read_temp_sensor`) rather than a single aliased register:
+        on the A6751sc, the SFNC ``DeviceTemperature`` name has no direct
+        match, and the FLIR-specific fallback that looked closest by name
+        (``FPAColdReg``) turned out to back a Boolean status flag, not a
+        temperature reading. Reads only the FPA sensor, independent of
+        :meth:`get_temperatures`, so it can't fail because some other
+        sensor isn't populated on this unit.
+        """
+        return self._read_temp_sensor(reg.TEMP_SENSORS["FPA"])
 
     # ------------------------------------------------------------------
     # Convenience wrappers
     # ------------------------------------------------------------------
 
     def get_exposure(self) -> float:
-        """Return current integration time in seconds."""
-        return self.read_float("ExposureTime")
+        """Return current integration time in seconds.
+
+        The backing register is in milliseconds (see :attr:`exposure_ms`),
+        so this divides by 1000 to honour its seconds contract.
+        """
+        return self.read_float("ExposureTime") / 1e3
 
     def set_exposure(self, seconds: float) -> None:
-        """Set integration time in seconds."""
-        self.write_float("ExposureTime", seconds)
+        """Set integration time in seconds.
+
+        The backing register is in milliseconds (see :attr:`exposure_ms`),
+        so this multiplies by 1000. Note the same calibration-coupling caveat
+        as :attr:`exposure_ms`.
+        """
+        self.exposure_ms = seconds * 1e3
 
     def get_frame_rate(self) -> float:
         """Return current acquisition frame rate in Hz."""
@@ -735,28 +854,195 @@ class Camera:
         self._gvcp.write_reg(reg.REG_CAL_INDEX, current)
         return blocks
 
-    def get_calibration_block(self) -> int:
-        """Return the currently active calibration block index."""
+    def _active_calibration_index(self) -> int | None:
+        """Return the browse index whose tag matches the *loaded* calibration.
+
+        ``CalibrationQueryIndex`` (``REG_CAL_INDEX``) is only a read-only
+        cursor into the factory calibration library; it does not necessarily
+        point at the calibration the streaming preset is actually using. The
+        live calibration is named by ``PS{n}CalibrationTag`` for the active
+        preset ``n``. This matches that tag back to a browse index so
+        :meth:`get_calibration` can return the coefficients that genuinely
+        apply to captured frames. Returns ``None`` if no block matches (the
+        caller then falls back to whatever the cursor currently points at).
+        The cursor is restored before returning.
+        """
         self._require_connected()
+        try:
+            preset = self._gvcp.read_reg(reg.REG_ACTIVE_PRESET)
+        except Exception:
+            preset = 0
+        tag_addr = reg.REG_PS_CALIBRATION_TAG.get(preset, reg.REG_PS_CALIBRATION_TAG[0])
+        try:
+            loaded_tag = self._read_string(tag_addr)
+        except Exception:
+            return None
+        if not loaded_tag:
+            return None
+        n_max = self._gvcp.read_reg(reg.REG_CAL_INDEX_MAX)
+        current = self._gvcp.read_reg(reg.REG_CAL_INDEX)
+        try:
+            for i in range(n_max + 1):
+                self._gvcp.write_reg(reg.REG_CAL_INDEX, i)
+                try:
+                    if self._read_string(reg.REG_CAL_TAG) == loaded_tag:
+                        return i
+                except Exception:
+                    continue
+        finally:
+            self._gvcp.write_reg(reg.REG_CAL_INDEX, current)
+        return None
+
+    def get_calibration_block(self) -> int:
+        """Return the calibration block actually applied to the live stream.
+
+        This is the browse index whose tag matches the calibration loaded on
+        the active preset (``PS{n}CalibrationTag``), not merely where the
+        ``CalibrationQueryIndex`` browse cursor happens to sit. Falls back to
+        the raw cursor value only if no loaded-tag match is found.
+        """
+        self._require_connected()
+        idx = self._active_calibration_index()
+        if idx is not None:
+            return idx
         return self._gvcp.read_reg(reg.REG_CAL_INDEX)
 
-    def set_calibration_block(self, index: int) -> None:
-        """Select a calibration block (temperature range)."""
+    def load_calibration(
+        self,
+        tag: str | None = None,
+        index: int | None = None,
+        preset: int | None = None,
+        timeout: float = 10.0,
+    ) -> dict:
+        """Load a factory calibration into a preset (changes the live stream).
+
+        This is the real "select a temperature range" operation. Writing
+        ``CalibrationQueryIndex`` alone only moves a read-only browse cursor
+        and does **not** change what the stream uses; the live calibration is
+        whatever is *loaded* into the preset via ``PS{n}CalibrationLoad``. This
+        method stages the calibration's tag into ``PS{n}CalibrationLoadTag``
+        (written 4 bytes at a time, since pyGigEVision has no WRITEMEM -- see
+        :meth:`_write_string_reg`) and executes the load command.
+
+        Loading a factory calibration **also sets that preset's integration
+        time** to the value the calibration was fit at -- the integration-time
+        ↔ calibration coupling FLIR's own software enforces, and the reason you
+        should not set :attr:`exposure_ms` independently. Verified live:
+        loading "25mm, Empty, -20C - 55C" moved the integration time from
+        0.1 ms to 2.354 ms.
+
+        Note: loading also brings in whatever NUC correction is stored with the
+        calibration, which may be stale for the current detector state. If the
+        image shows heavy fixed-pattern noise afterwards, run
+        :meth:`perform_nuc` to compute a fresh correction at the new
+        integration time.
+
+        Args:
+            tag: Exact calibration tag to load (e.g. ``"25mm, Empty, -20C - 55C"``);
+                see :meth:`get_calibration_blocks` for available tags. Mutually
+                exclusive with *index*.
+            index: Browse index (0..``CalibrationQueryIndexMax``) whose tag to
+                load. Mutually exclusive with *tag*.
+            preset: Preset to load into. Defaults to the active preset.
+            timeout: Seconds to wait for the loaded tag to take effect.
+
+        Returns:
+            dict with ``preset``, ``tag`` (the tag now loaded), and
+            ``exposure_ms`` (the integration time the load set).
+
+        Raises:
+            CameraError: if neither/both of *tag*/*index* are given, if the
+                index has no tag, or if the load does not take effect in time.
+        """
         self._require_connected()
-        self._gvcp.write_reg(reg.REG_CAL_INDEX, index)
+        if (tag is None) == (index is None):
+            raise CameraError("Pass exactly one of tag= or index=.")
+        if preset is None:
+            try:
+                preset = self._gvcp.read_reg(reg.REG_ACTIVE_PRESET)
+            except Exception:
+                preset = 0
+        if preset not in reg.REG_PS_CALIBRATION_LOAD_TAG:
+            raise CameraError(f"Invalid preset {preset}; expected 0-3.")
+
+        if index is not None:
+            # Resolve the tag from the browse cursor, then restore the cursor.
+            n_max = self._gvcp.read_reg(reg.REG_CAL_INDEX_MAX)
+            if not (0 <= index <= n_max):
+                raise CameraError(f"Calibration index {index} out of range 0-{n_max}.")
+            cursor = self._gvcp.read_reg(reg.REG_CAL_INDEX)
+            try:
+                self._gvcp.write_reg(reg.REG_CAL_INDEX, index)
+                tag = self._read_string(reg.REG_CAL_TAG)
+            finally:
+                self._gvcp.write_reg(reg.REG_CAL_INDEX, cursor)
+            if not tag:
+                raise CameraError(f"Calibration index {index} has no tag to load.")
+
+        # Stage the tag and verify it landed byte-exactly before executing.
+        self._write_string_reg(reg.REG_PS_CALIBRATION_LOAD_TAG[preset], tag)
+        staged = self._read_string(reg.REG_PS_CALIBRATION_LOAD_TAG[preset])
+        if staged != tag:
+            raise CameraError(
+                f"Failed to stage calibration tag (wrote {tag!r}, read back {staged!r})."
+            )
+
+        self._gvcp.write_reg(reg.REG_PS_CALIBRATION_LOAD[preset], 1)
+
+        # Poll until the loaded tag reflects the request. The camera is busy
+        # reconfiguring during the load and may briefly stop answering READMEM
+        # (transient GVCP timeout), so treat a failed read as "not ready yet"
+        # and keep polling rather than aborting.
+        deadline = time.monotonic() + timeout
+        loaded = ""
+        while time.monotonic() < deadline:
+            try:
+                loaded = self._read_string(reg.REG_PS_CALIBRATION_TAG[preset])
+            except GVCPError:
+                loaded = ""
+            if loaded == tag:
+                break
+            time.sleep(0.1)
+        if loaded != tag:
+            raise CameraError(
+                f"Calibration load did not take effect within {timeout}s "
+                f"(requested {tag!r}, loaded tag is {loaded!r})."
+            )
+        return {"preset": preset, "tag": loaded, "exposure_ms": self.exposure_ms}
+
+    def set_calibration_block(self, index: int) -> None:
+        """Load the factory calibration at browse *index* into the active preset.
+
+        Thin wrapper over :meth:`load_calibration` (``index=`` form). Note this
+        genuinely loads the calibration -- which also changes the preset's
+        integration time -- unlike merely moving the browse cursor. See
+        :meth:`load_calibration` for the full contract and the NUC caveat.
+        """
+        self.load_calibration(index=index)
 
     def get_calibration(self, block: int | None = None) -> dict:
         """Read calibration data for a calibration block.
 
-        If *block* is ``None`` the currently active block is used.
-        The active block is restored after reading.
+        If *block* is ``None`` the calibration **actually loaded** on the
+        active preset is used (matched by tag, see
+        :meth:`_active_calibration_index`), not merely whatever the browse
+        cursor points at -- so :meth:`counts_to_temperature` converts against
+        the polynomial that genuinely applies to captured frames. Pass an
+        explicit *block* index to read a specific library entry instead. The
+        browse cursor is restored after reading.
 
-        Temperature conversion uses two polynomials:
+        Temperature conversion uses two polynomials, applied by
+        :func:`apply_calibration` (see its docstring for the full formula,
+        including background subtraction and object-parameter compensation,
+        and their provenance):
 
         1. counts → radiance:  W = Σ counts_coeffs[i] · counts^i − counts_background
         2. radiance → temp °C: T_C = Σ temp_coeffs[i] · W^i
 
-        Both tmin/tmax and the temp polynomial output are in °C.
+        tmin/tmax are confirmed °C despite the camera's GenICam XML
+        mislabeling the backing registers "in Kelvin" in free-text only (no
+        structured ``<Unit>`` tag); see the comment on
+        :data:`pyflir.registers.REG_CAL_TMIN`.
 
         Returns:
             dict with keys: ``block``, ``tmin``, ``tmax`` (°C),
@@ -765,8 +1051,13 @@ class Camera:
         """
         self._require_connected()
         prev = self._gvcp.read_reg(reg.REG_CAL_INDEX)
-        if block is not None:
-            self._gvcp.write_reg(reg.REG_CAL_INDEX, block)
+        # When no explicit block is requested, point the browse cursor at the
+        # calibration actually loaded on the active preset (matched by tag),
+        # not wherever the cursor happens to sit, so the coefficients returned
+        # are the ones the live stream really uses.
+        target = block if block is not None else self._active_calibration_index()
+        if target is not None:
+            self._gvcp.write_reg(reg.REG_CAL_INDEX, target)
         try:
             c_order = self.read_int("CalibrationQueryOrderReg")
             c_coeffs = [self.read_float(f"CalibrationQueryCoeff{i}Reg") for i in range(c_order + 1)]
@@ -778,8 +1069,10 @@ class Camera:
                 "block": self._gvcp.read_reg(reg.REG_CAL_INDEX),
                 "tmin": self._gvcp.read_float(reg.REG_CAL_TMIN),
                 "tmax": self._gvcp.read_float(reg.REG_CAL_TMAX),
-                "counts_min": self.read_float("CalibrationQueryMinCountsReg"),
-                "counts_max": self.read_float("CalibrationQueryMaxCountsReg"),
+                # IntReg on the A6751sc (native 14-bit ADC counts), not FloatReg;
+                # read_float() would reinterpret the raw integer bits as IEEE-754.
+                "counts_min": self.read_int("CalibrationQueryMinCountsReg"),
+                "counts_max": self.read_int("CalibrationQueryMaxCountsReg"),
                 "counts_order": c_order,
                 "counts_coeffs": c_coeffs,
                 "counts_background": self.read_float("CalibrationQueryBackgroundValueReg"),
@@ -787,7 +1080,7 @@ class Camera:
                 "temp_coeffs": t_coeffs,
             }
         finally:
-            if block is not None:
+            if target is not None:
                 self._gvcp.write_reg(reg.REG_CAL_INDEX, prev)
 
     def counts_to_temperature(
@@ -797,27 +1090,30 @@ class Camera:
         refl_temp_c: float | None = None,
         atm_temp_c: float | None = None,
         tau: float = 1.0,
+        return_status: bool = False,
     ) -> "np.ndarray":
         """Convert a raw uint16 frame to temperature in degrees Celsius.
 
         Reads calibration for the currently active block, then applies
-        two polynomial steps:
-
-        1. counts → radiance:  W = Σ counts_coeffs[i] · counts^i − background
-        2. radiance → °C:      T_C = Σ temp_coeffs[i] · W^i
+        :func:`apply_calibration` -- see its docstring for the exact formula,
+        including the object-parameter (emissivity/atmosphere/reflected)
+        compensation and its provenance.
 
         If *emissivity*, *refl_temp_c*, or *atm_temp_c* are omitted they
         default to the values previously set via :meth:`set_object_params`.
 
         Args:
-            counts:      2-D uint16 array (H, W) from :meth:`grab` or :meth:`read`.
-            emissivity:  Object surface emissivity (0–1).
-            refl_temp_c: Reflected apparent temperature in °C.
-            atm_temp_c:  Atmospheric temperature in °C.
-            tau:         Atmospheric transmission (0–1). 1 = no atmosphere.
+            counts:        2-D uint16 array (H, W) from :meth:`grab` or :meth:`read`.
+            emissivity:    Object surface emissivity (0–1).
+            refl_temp_c:   Reflected apparent temperature in °C.
+            atm_temp_c:    Atmospheric temperature in °C.
+            tau:           Atmospheric transmission (0–1). 1 = no atmosphere.
+            return_status: If True, also return a per-pixel status array (see
+                :func:`apply_calibration`).
 
         Returns:
-            Float64 array (H, W) with temperature in degrees Celsius.
+            Float64 array (H, W) with temperature in degrees Celsius, or
+            ``(temperature, status)`` if *return_status* is True.
 
         Example::
 
@@ -840,7 +1136,9 @@ class Camera:
                 atm_temp_c = atm_temp_c if atm_temp_c is not None else 23.0
 
         cal = self.get_calibration()
-        return apply_calibration(counts, cal, emissivity, refl_temp_c, atm_temp_c, tau)
+        return apply_calibration(
+            counts, cal, emissivity, refl_temp_c, atm_temp_c, tau, return_status=return_status
+        )
 
     # ------------------------------------------------------------------
     # Radiometry parameters
@@ -960,10 +1258,19 @@ class Camera:
             )
         if height < h_min:
             raise CameraError(f"Height {height} is below the minimum {h_min}.")
-        if h_inc > 0 and ((height - h_min) % h_inc) != 0:
+        # Validate the increment against the camera's raw row domain (image +
+        # metadata rows), not the usable-row h_min from get_roi_limits(): that
+        # value is clamped to a floor of 1 for sensible display, which silently
+        # corrupts this modular check whenever the true unclamped baseline
+        # (h_min_raw - metadata_rows) is <= 0 -- confirmed live on the A6751sc,
+        # where it wrongly rejected height=512 (raw 513), a value every capture
+        # this session had already proven valid.
+        h_min_raw = self._gvcp.read_reg(reg.REG_HEIGHT_MIN)
+        raw_height = height + self._metadata_rows
+        if h_inc > 0 and ((raw_height - h_min_raw) % h_inc) != 0:
             raise CameraError(
                 f"Height {height} does not satisfy the increment constraint "
-                f"(height − {h_min}) must be a multiple of {h_inc}."
+                f"(raw height {raw_height} − {h_min_raw}) must be a multiple of {h_inc}."
             )
         if height + offset_y > h_max:
             raise CameraError(
@@ -993,37 +1300,289 @@ class Camera:
     # NUC (Non-Uniformity Correction)
     # ------------------------------------------------------------------
 
-    def trigger_nuc(self, preset: int = 0) -> None:
-        """Apply the stored NUC correction coefficients for the given preset.
-
-        Loads pre-computed correction data (PS0–PS3) into the active pipeline.
-        Does not compute a new NUC; to do that, move the physical flag into
-        the FOV, capture a flat-field frame, then save and re-apply.
+    def get_nuc_status(self, preset: int = 0) -> dict:
+        """Return the NUC correction currently loaded for *preset*.
 
         Args:
-            preset: Preset index to correct (0–3). Default 0.
+            preset: Preset index to query (0–3). Default 0.
+
+        Returns:
+            dict with key ``name`` (str, the currently loaded correction's
+            name; empty string if none is loaded).
         """
         self._require_connected()
-        if preset not in reg.REG_NUC_LOAD:
+        if preset not in reg.REG_CORRECTION_NAME:
             raise CameraError(f"Invalid preset {preset}. Must be 0–3.")
-        self._gvcp.write_reg(reg.REG_NUC_LOAD[preset], 1)
-        logger.info("NUC correction applied for preset %d.", preset)
+        return {"name": self._read_string(reg.REG_CORRECTION_NAME[preset])}
+
+    def has_flag(self) -> bool:
+        """Return whether this camera has a physical NUC flag (shutter)."""
+        self._require_connected()
+        return bool(self._gvcp.read_reg(reg.REG_FLAG_PRESENT))
+
+    def get_flag_state(self) -> str:
+        """Return the NUC flag's current position: ``"Stowed"`` or ``"InFOV"``.
+
+        Raises:
+            CameraError: If this camera has no NUC flag (see :meth:`has_flag`).
+        """
+        self._require_connected()
+        if not self.has_flag():
+            raise CameraError("This camera has no NUC flag (has_flag() is False).")
+        raw = self._gvcp.read_reg(reg.REG_FLAG_STATE)
+        return reg.FLAG_STATE_NAMES.get(raw, f"<unknown:{raw}>")
 
     def flag_move_in_fov(self) -> None:
         """Move the internal NUC flag into the field of view.
 
         Only available on cameras equipped with a physical shutter
         (e.g. FLIR A6751sc). Call before capturing a flat-field reference.
+
+        This only sends the move command; the flag is a physical mechanism
+        and takes time to actually reach position. Poll
+        :meth:`get_flag_state` for ``"InFOV"`` before capturing a flat-field
+        frame rather than assuming the move completed instantly.
         """
         self._require_connected()
         self._gvcp.write_reg(reg.REG_FLAG_IN_FOV, 1)
         logger.info("NUC flag commanded into FOV.")
 
     def flag_move_stowed(self) -> None:
-        """Move the internal NUC flag out of the field of view."""
+        """Move the internal NUC flag out of the field of view.
+
+        See :meth:`flag_move_in_fov` for why this doesn't wait for the
+        physical move to complete.
+        """
         self._require_connected()
         self._gvcp.write_reg(reg.REG_FLAG_STOWED, 1)
         logger.info("NUC flag commanded to stowed position.")
+
+    # ------------------------------------------------------------------
+    # NUC: performing a new correction. GenICam group "CorrectionPerform":
+    # a state machine, see registers.py for the full status/result enum
+    # tables.
+    # ------------------------------------------------------------------
+
+    def get_correction_status(self) -> dict:
+        """Return the live status of an in-progress (or just-finished) NUC correction.
+
+        Returns:
+            dict with keys ``status`` (str, e.g. ``"Ready"``,
+            ``"CollectingFirstSource"``, ``"WaitingForFirstSourceExternal"``
+            -- see :data:`pyflir.registers.CORRECTION_STATUS_NAMES` for the
+            full set) and ``text`` (str, human-readable detail from the
+            camera, descriptive enough to know what to do next).
+        """
+        self._require_connected()
+        raw = self._gvcp.read_reg(reg.REG_CORRECTION_STATUS)
+        status = reg.CORRECTION_STATUS_NAMES.get(raw, f"<unknown:{raw}>")
+        return {"status": status, "text": self._read_string(reg.REG_CORRECTION_STATUS_TEXT)}
+
+    def get_correction_result(self) -> dict:
+        """Return the outcome of the most recently completed NUC correction.
+
+        Returns:
+            dict with keys ``result`` (str: ``"Okay"``, ``"Abort"``,
+            ``"AbortInvalidParam"``, or ``"AbortFlagCoolerRunaway"``) and
+            ``text`` (str, human-readable detail from the camera).
+        """
+        self._require_connected()
+        raw = self._gvcp.read_reg(reg.REG_CORRECTION_RESULT)
+        result = reg.CORRECTION_RESULT_NAMES.get(raw, f"<unknown:{raw}>")
+        return {"result": result, "text": self._read_string(reg.REG_CORRECTION_RESULT_TEXT)}
+
+    def correction_start(
+        self,
+        preset: int = 0,
+        correction_type: str = "OnePoint",
+        source: str = "Internal",
+    ) -> None:
+        """Start a new NUC correction process (low-level).
+
+        Prefer :meth:`perform_nuc` for the common case (internal flag,
+        fully automatic, blocks until done). Use this directly for a
+        "TwoPoint" or ``source="External"`` workflow, which need a person
+        to present a uniform target and call :meth:`correction_continue`
+        partway through -- :meth:`perform_nuc` doesn't support those.
+
+        After calling this, poll :meth:`get_correction_status` and act on
+        the status:
+
+        - ``"WaitingForFirst/SecondSourceExternal"``: present a uniform
+          target in the field of view, then call :meth:`correction_continue`.
+        - ``"WaitingForFirst/SecondSourceInternal"``: no action needed, the
+          camera is bringing its own flag to temperature; keep polling.
+        - ``"Ready"``: the process is complete. Check
+          :meth:`get_correction_result`, then call :meth:`correction_accept`
+          or :meth:`correction_discard`.
+
+        Args:
+            preset: Preset index to correct (0–3). Default 0.
+            correction_type: ``"OnePoint"`` (offset only -- the standard
+                routine flat-field NUC), ``"TwoPoint"`` (gain and offset,
+                needs two distinct uniform sources), or ``"UpdateOffset"``
+                (offset only, gain unchanged, faster than a full OnePoint).
+            source: ``"Internal"`` (the camera's own NUC flag, fully
+                automatic) or ``"External"`` (a uniform target you present
+                yourself).
+
+        Raises:
+            CameraError: If *preset*, *correction_type*, or *source* is invalid.
+        """
+        self._require_connected()
+        if preset not in reg.REG_CORRECTION_PS:
+            raise CameraError(f"Invalid preset {preset}. Must be 0–3.")
+        type_values = {v: k for k, v in reg.CORRECTION_TYPE_NAMES.items()}
+        if correction_type not in type_values:
+            raise CameraError(
+                f"Invalid correction_type {correction_type!r}. Must be one of {list(type_values)}."
+            )
+        source_values = {v: k for k, v in reg.CORRECTION_SOURCE_NAMES.items()}
+        if source not in source_values:
+            raise CameraError(f"Invalid source {source!r}. Must be one of {list(source_values)}.")
+
+        self._gvcp.write_reg(reg.REG_CORRECTION_TYPE, type_values[correction_type])
+        self._gvcp.write_reg(reg.REG_CORRECTION_SOURCE, source_values[source])
+        for p, addr in reg.REG_CORRECTION_PS.items():
+            self._gvcp.write_reg(addr, 1 if p == preset else 0)
+        self._gvcp.write_reg(reg.REG_CORRECTION_START, 1)
+        logger.info(
+            "NUC correction started for preset %d (%s, %s source).", preset, correction_type, source
+        )
+
+    def correction_continue(self) -> None:
+        """Advance past a "WaitingFor...SourceExternal" status.
+
+        Call after presenting a uniform target in the field of view.
+        """
+        self._require_connected()
+        self._gvcp.write_reg(reg.REG_CORRECTION_CONTINUE, 1)
+
+    def correction_accept(self) -> None:
+        """Keep the new correction computed by the current/last process."""
+        self._require_connected()
+        self._gvcp.write_reg(reg.REG_CORRECTION_ACCEPT, 1)
+
+    def correction_discard(self) -> None:
+        """Discard the new correction and revert to the previous one."""
+        self._require_connected()
+        self._gvcp.write_reg(reg.REG_CORRECTION_DISCARD, 1)
+
+    def correction_abort(self) -> None:
+        """Cancel an in-progress correction process.
+
+        Per the camera's own GenICam description, a started process must be
+        accepted, discarded, or aborted to properly end it.
+        """
+        self._require_connected()
+        self._gvcp.write_reg(reg.REG_CORRECTION_ABORT, 1)
+
+    def perform_nuc(
+        self,
+        preset: int = 0,
+        correction_type: str = "OnePoint",
+        timeout: float = 60.0,
+        poll_interval: float = 0.5,
+        auto_accept: bool = True,
+    ) -> dict:
+        """Perform a new NUC (Non-Uniformity Correction) now.
+
+        This is the "just run it and it does NUC" command: it computes a
+        fresh correction and blocks until done, using the camera's own
+        internal NUC flag as the uniform reference -- fully automatic, the
+        camera brings the flag to temperature and captures the reference
+        itself, no user action needed.
+
+        For an external-blackbody or "TwoPoint" workflow, which need a
+        person to present a target and call :meth:`correction_continue`
+        partway through, use :meth:`correction_start` directly instead.
+
+        Args:
+            preset: Preset index to correct (0–3). Default 0.
+            correction_type: ``"OnePoint"`` (offset only -- the standard
+                routine flat-field NUC, default) or ``"UpdateOffset"``
+                (offset only, faster, meant for use between full
+                corrections). Not ``"TwoPoint"``: that needs two distinct
+                uniform sources, which a single internal flag at one
+                temperature can't provide -- use :meth:`correction_start`
+                for it.
+            timeout: Seconds to wait for the process to reach ``"Ready"``
+                before aborting and raising. Generous by default since the
+                flag may take a while to reach its target temperature.
+            poll_interval: Seconds between status polls.
+            auto_accept: If True (default), call :meth:`correction_accept`
+                automatically once the result is ``"Okay"``. If False,
+                leave the correction pending for you to accept or discard.
+
+        Returns:
+            dict from :meth:`get_correction_result` (keys ``result``, ``text``).
+
+        Raises:
+            CameraError: If the camera has no NUC flag, *preset* or
+                *correction_type* is invalid, the process times out, the
+                camera unexpectedly asks for an external source, or the
+                result is not ``"Okay"``.
+
+        Warning:
+            Not yet verified against a live camera -- implemented from the
+            camera's own GenICam XML (register addresses and the
+            Start/Continue/Accept/Discard/Abort state machine), not tested
+            end to end. Try a short *timeout* first and watch logs before
+            relying on it.
+        """
+        self._require_connected()
+        if not self.has_flag():
+            raise CameraError(
+                "This camera has no NUC flag (has_flag() is False); perform_nuc() "
+                "requires the internal-flag source. Use correction_start(source="
+                "'External', ...) with a uniform target instead."
+            )
+        if correction_type == "TwoPoint":
+            raise CameraError(
+                "TwoPoint correction needs two distinct uniform sources; not "
+                "meaningful with a single internal flag at one temperature. "
+                "Use correction_start() directly for a TwoPoint/External workflow."
+            )
+
+        self.correction_start(preset=preset, correction_type=correction_type, source="Internal")
+
+        deadline = time.monotonic() + timeout
+        external_statuses = {"WaitingForFirstSourceExternal", "WaitingForSecondSourceExternal"}
+        while True:
+            status = self.get_correction_status()
+            if status["status"] == "Ready":
+                break
+            if status["status"] in external_statuses:
+                with contextlib.suppress(Exception):
+                    self.correction_abort()
+                raise CameraError(
+                    f"Camera unexpectedly asked for an external uniform source "
+                    f"({status['status']}) despite requesting the internal flag; "
+                    f"aborted. {status['text']}"
+                )
+            if time.monotonic() >= deadline:
+                with contextlib.suppress(Exception):
+                    self.correction_abort()
+                raise CameraError(
+                    f"NUC correction timed out after {timeout:.0f}s "
+                    f"(last status: {status['status']} - {status['text']})."
+                )
+            time.sleep(poll_interval)
+
+        result = self.get_correction_result()
+        if result["result"] != "Okay":
+            raise CameraError(f"NUC correction failed: {result['result']} - {result['text']}")
+
+        if auto_accept:
+            self.correction_accept()
+            logger.info("NUC correction complete and accepted for preset %d.", preset)
+        else:
+            logger.info(
+                "NUC correction complete for preset %d; call correction_accept() "
+                "or correction_discard() to finish.",
+                preset,
+            )
+        return result
 
     # ------------------------------------------------------------------
     # Diagnostics
@@ -1032,20 +1591,50 @@ class Camera:
     def get_temperatures(self) -> dict[str, float]:
         """Read all available on-board temperature sensors.
 
-        Returns a dict with keys ``FPA``, ``Digitizer``, ``PowerBoard``,
-        ``FrontPanel`` (degrees Celsius). The selector register is
-        restored to its original value after reading.
+        :data:`pyflir.registers.TEMP_SENSORS` is defined generically from
+        the camera's ``DeviceTemperatureSelector`` enum (9 entries), which
+        is shared across the whole product line -- not every physical unit
+        necessarily has every sensor populated. A sensor whose read fails
+        is skipped (logged at debug level) rather than aborting the whole
+        call, confirmed necessary live: on the A6751sc this session, one of
+        the newer selector indices raised ``GVCPError: GENERIC_ERROR``.
+
+        Returns:
+            dict mapping sensor name to temperature in degrees Celsius, for
+            whichever of :data:`pyflir.registers.TEMP_SENSORS` responded
+            successfully. See :meth:`detector_temperature` for reading just
+            FPA, which doesn't depend on any of the others being available.
         """
         self._require_connected()
         original = self._gvcp.read_reg(reg.REG_TEMP_SELECTOR)
         temps: dict[str, float] = {}
         try:
             for name, idx in reg.TEMP_SENSORS.items():
-                self._gvcp.write_reg(reg.REG_TEMP_SELECTOR, idx)
-                temps[name] = self._gvcp.read_float(reg.REG_TEMP_VALUE)
+                try:
+                    self._gvcp.write_reg(reg.REG_TEMP_SELECTOR, idx)
+                    temps[name] = self._gvcp.read_float(reg.REG_TEMP_VALUE)
+                except GVCPError as exc:
+                    logger.debug(
+                        "Temperature sensor %r (index %d) not readable: %s", name, idx, exc
+                    )
         finally:
             self._gvcp.write_reg(reg.REG_TEMP_SELECTOR, original)
         return temps
+
+    def _read_temp_sensor(self, index: int) -> float:
+        """Read one on-board temperature sensor by selector index.
+
+        Independent of :meth:`get_temperatures`: reads only this one
+        sensor, so it can't fail because a *different* sensor isn't
+        populated on this unit. Restores the selector register afterward.
+        """
+        self._require_connected()
+        original = self._gvcp.read_reg(reg.REG_TEMP_SELECTOR)
+        try:
+            self._gvcp.write_reg(reg.REG_TEMP_SELECTOR, index)
+            return self._gvcp.read_float(reg.REG_TEMP_VALUE)
+        finally:
+            self._gvcp.write_reg(reg.REG_TEMP_SELECTOR, original)
 
     def info(self) -> dict:
         """Return a dict of the camera's current state.
@@ -1074,8 +1663,10 @@ class Camera:
         fmax = self.get_max_frame_rate()
         out["frame_rate_max_hz"] = round(fmax, 2) if fmax is not None else None
         out["exposure_ms"] = _safe(lambda: round(self.read_float("ExposureTime") * 1e3, 3))
-        out["detector_temp_C"] = _safe(lambda: round(self.read_float("DeviceTemperature"), 2))
-        out["calibration_block"] = _safe(lambda: self._gvcp.read_reg(reg.REG_CAL_INDEX))
+        out["detector_temp_C"] = _safe(lambda: round(self.detector_temperature, 2))
+        # The block actually applied to the stream (matched by loaded tag),
+        # not the raw browse-cursor position.
+        out["calibration_block"] = _safe(self.get_calibration_block)
         return out
 
     # ------------------------------------------------------------------
@@ -1147,10 +1738,38 @@ class Camera:
             s.connect((self.ip, 3956))
             return s.getsockname()[0]
 
+    def _read_string(self, addr: int, length: int = 256) -> str:
+        """Read a null-terminated ASCII string from a fixed-length StringReg."""
+        raw = self._gvcp.read_mem(addr, length)
+        return raw.split(b"\x00")[0].decode("ascii", errors="replace").strip()
+
+    def _write_string_reg(self, addr: int, text: str, length: int = 256) -> None:
+        """Write an ASCII string to a fixed-length StringReg region.
+
+        pyGigEVision exposes no GVCP WRITEMEM, only single-register WRITEREG,
+        so the string is written 4 bytes at a time to consecutive addresses.
+        These StringReg regions store bytes little-endian within each 32-bit
+        word (verified live: a big-endian write read back byte-swapped per
+        word), so each 4-byte group is packed little-endian. The value is
+        NUL-padded to *length* so any previous longer contents are cleared.
+        """
+        data = text.encode("ascii")[: length - 1]
+        data = data + b"\x00" * (length - len(data))
+        for off in range(0, length, 4):
+            word = struct.unpack("<I", data[off : off + 4])[0]
+            self._gvcp.write_reg(addr + off, word)
+
 
 # ---------------------------------------------------------------------------
 # Standalone radiometric conversion (works offline with a cached cal dict)
 # ---------------------------------------------------------------------------
+
+
+# Per-pixel status codes for apply_calibration(return_status=True), mirroring
+# FLIR's own fnv.file.ImagerFile.status ("overflow, underflow, warning").
+STATUS_OK = 0
+STATUS_UNDERFLOW = 1  # raw (14-bit) count below this block's counts_min
+STATUS_OVERFLOW = 2  # raw (14-bit) count above this block's counts_max
 
 
 def apply_calibration(
@@ -1160,7 +1779,8 @@ def apply_calibration(
     refl_temp_c: float = 23.0,
     atm_temp_c: float = 23.0,
     tau: float = 1.0,
-) -> np.ndarray:
+    return_status: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Convert raw uint16 counts to °C using a pre-read calibration dict.
 
     This is the offline equivalent of :meth:`Camera.counts_to_temperature`.
@@ -1172,15 +1792,52 @@ def apply_calibration(
 
     Applies two polynomial steps:
 
-    1. counts → radiance: W = Σ counts_coeffs[i] · counts^i
+    1. counts → radiance: W = Σ counts_coeffs[i] · counts^i − counts_background
     2. radiance → temp:   T = Σ temp_coeffs[i] · W^i
 
     Counts are first un-shifted from MSB-aligned Mono16 to the native
-    14-bit ADC range when needed (uint16 = adc << 2) and clipped to the
-    calibrated domain [counts_min, counts_max].  Whether the temperature
-    polynomial outputs Kelvin or Celsius — and whether the background
-    value must be subtracted from W — is resolved automatically by
-    checking the chain against the block endpoints (tmin/tmax, °C).
+    14-bit ADC range when needed (uint16 = adc << 2), then clipped to
+    [counts_min, counts_max] (out-of-range pixels are flagged in the
+    optional *status* output rather than silently extrapolated). Whether
+    the temperature polynomial outputs Kelvin or Celsius is resolved
+    automatically by checking the chain against the block endpoints
+    (tmin/tmax, confirmed °C -- see the comment on
+    :data:`pyflir.registers.REG_CAL_TMIN`).
+
+    Provenance, since none of this is directly visible from the camera's
+    GenICam XML alone: FLIR's own Science File SDK (extracted read-only from
+    ``FLIRScienceFileSDK-2026.1.2+10-Linux-aarch64.run`` for inspection, not
+    executed -- it targets Linux ARM64 and this project runs on Windows) has
+    a ``CNicevilleFactoryCalReduceObject`` struct whose fields
+    (``polyOrder``, ``coeffs[7]``, ``bgValue``, ``tempPolyOrder``,
+    ``tempCoeffs[7]``, ``cmin``/``cmax`` as ``uint16_t``) map 1:1 onto this
+    camera's ``CalibrationQuery*`` registers, with ``bgValue`` grouped under
+    the same "count->rad" comment as the counts polynomial -- strong
+    evidence it belongs in step 1, matching what this function now does.
+    Separately, ``fnv.file.ImagerFile.status`` ("overflow, underflow,
+    warning") and ``IConverter``'s explicit clip parameters confirm FLIR's
+    reference implementation never silently extrapolates out-of-range
+    pixels, which is why this function now clips and flags instead.
+
+    When *emissivity* != 1.0 or *tau* != 1.0, the standard object-signal
+    equation (published thermography practice, not extracted from FLIR's
+    compiled code -- that part is closed-source) is applied on top:
+
+        W_total = ε·τ·W_obj + (1−ε)·τ·W_refl + (1−τ)·W_atm
+
+    solved for W_obj, where W_refl/W_atm are obtained by numerically
+    inverting the radiance→temperature polynomial at *refl_temp_c*/
+    *atm_temp_c*. With the defaults (ε=1, τ=1) this reduces exactly to
+    W_obj = W_total, i.e. unchanged behavior from before this parameter was
+    wired in -- existing callers using the defaults are unaffected.
+
+    None of the above (background subtraction, clipping, or the object-
+    parameter compensation) has been verified against a live camera yet --
+    there wasn't one connected while this was written. The most direct
+    check: for every calibration block index (0..CalibrationQueryIndexMax),
+    evaluate this chain at that block's own counts_min/counts_max and
+    compare against that block's own tmin/tmax -- each block carries its own
+    ground truth, no external reference file needed.
 
     Parameters
     ----------
@@ -1189,21 +1846,28 @@ def apply_calibration(
     cal : dict
         Calibration dict from :meth:`Camera.get_calibration`.
     emissivity : float
-        Unused (reserved). Default 1.0.
+        Object surface emissivity (0-1]. Default 1.0 (no correction).
     refl_temp_c : float
-        Unused (reserved). Default 23.0.
+        Reflected apparent temperature in °C. Only used when emissivity != 1.
     atm_temp_c : float
-        Unused (reserved). Default 23.0.
+        Atmospheric temperature in °C. Only used when tau != 1.
     tau : float
-        Unused (reserved). Default 1.0.
+        Atmospheric transmission (0-1]. Default 1.0 (no correction).
+    return_status : bool
+        If True, also return a per-pixel status array (:data:`STATUS_OK`,
+        :data:`STATUS_UNDERFLOW`, :data:`STATUS_OVERFLOW`). Default False.
 
     Returns
     -------
     np.ndarray
         Float64 array (H, W) with temperature in degrees Celsius.
+    np.ndarray, optional
+        uint8 array (H, W) of status codes, only if *return_status* is True.
     """
     cmin = float(cal["counts_min"])
+    cmax = float(cal["counts_max"])
     tmin = float(cal["tmin"])
+    background = float(cal.get("counts_background", 0.0))
 
     # The A6751sc has a 14-bit ADC but GigE Vision streams Mono16 with the
     # value left-justified (uint16 = adc_14bit << 2).  The calibration
@@ -1211,24 +1875,56 @@ def apply_calibration(
     # raw pixel values by 4 to bring them into the same domain.
     x = counts.astype(np.float64) / 4.0
 
-    # Two-polynomial radiometric conversion (no background subtraction):
-    #   1. counts (14-bit) → radiance w
+    status = np.full(x.shape, STATUS_OK, dtype=np.uint8)
+    status[x < cmin] = STATUS_UNDERFLOW
+    status[x > cmax] = STATUS_OVERFLOW
+    x = np.clip(x, cmin, cmax)
+
+    # Two-polynomial radiometric conversion:
+    #   1. counts (14-bit) → radiance w, background-subtracted
     #   2. radiance w → temperature
     # np.polyval expects highest-degree coefficient first; the camera stores
     # them lowest-degree first, so reverse before calling polyval.
     c_hi = np.asarray(cal["counts_coeffs"], dtype=np.float64)[::-1]
     t_hi = np.asarray(cal["temp_coeffs"], dtype=np.float64)[::-1]
-    w = np.polyval(c_hi, x)
-    t = np.polyval(t_hi, w)
+    w_total = np.polyval(c_hi, x) - background
 
     # Determine K→C offset by checking the polynomial output at the known
     # block endpoints (tmin/tmax are confirmed Celsius).  If the polynomial
     # outputs Kelvin, the endpoint values will be ~273 higher than tmin/tmax.
-    w_lo = float(np.polyval(c_hi, cmin))
+    w_lo = float(np.polyval(c_hi, cmin)) - background
     t_lo = float(np.polyval(t_hi, w_lo))
     offs = 273.15 if abs(t_lo - 273.15 - tmin) < abs(t_lo - tmin) else 0.0
 
-    return t - offs
+    w_obj = w_total
+    if emissivity != 1.0 or tau != 1.0:
+        w_cmin = float(np.polyval(c_hi, cmin)) - background
+        w_cmax = float(np.polyval(c_hi, cmax)) - background
+
+        def _radiance_at(temp_c: float) -> float:
+            """Invert the radiance→temperature polynomial at a known temperature."""
+            target = temp_c + offs
+            shifted = t_hi.copy()
+            shifted[-1] -= target
+            roots = np.roots(shifted)
+            real_roots = roots[np.abs(roots.imag) < 1e-6].real
+            lo, hi = sorted((w_cmin, w_cmax))
+            if real_roots.size == 0:
+                raise ValueError(f"Could not invert temperature→radiance polynomial for {temp_c}°C")
+            in_domain = real_roots[(real_roots >= lo) & (real_roots <= hi)]
+            candidates = in_domain if in_domain.size else real_roots
+            return float(candidates[np.argmin(np.abs(candidates - (lo + hi) / 2))])
+
+        w_refl = _radiance_at(refl_temp_c)
+        w_atm = _radiance_at(atm_temp_c)
+        w_obj = (w_total - (1 - emissivity) * tau * w_refl - (1 - tau) * w_atm) / (emissivity * tau)
+
+    t = np.polyval(t_hi, w_obj)
+    result = t - offs
+
+    if return_status:
+        return result, status
+    return result
 
 
 # ---------------------------------------------------------------------------

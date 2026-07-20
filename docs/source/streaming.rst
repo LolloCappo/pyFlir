@@ -75,14 +75,13 @@ rows are stripped from every returned frame; the stripped data is accessible on
 NUC and flag
 ------------
 
-Non-Uniformity Correction improves image uniformity. The workflow is to move the
-physical flag in front of the detector, apply NUC, then stow the flag:
+Non-Uniformity Correction improves image uniformity. ``perform_nuc()`` computes
+a fresh correction and drives the internal flag automatically -- no manual flag
+handling needed:
 
 .. code-block:: python
 
-    cam.flag_move_in_fov()    # physical flag blocks the detector
-    cam.trigger_nuc()         # apply NUC coefficients
-    cam.flag_move_stowed()    # stow flag, resume imaging
+    cam.perform_nuc()         # compute a fresh correction, blocks until done
 
 The camera must be streaming or in a suitable state for the NUC command to be
 accepted; refer to the camera's hardware manual for timing requirements.
@@ -90,8 +89,10 @@ accepted; refer to the camera's hardware manual for timing requirements.
 Calibration blocks
 ------------------
 
-FLIR A-series cameras store multiple calibration presets, each covering a
-different temperature range. List and select them:
+FLIR A-series cameras store multiple factory calibrations, each covering a
+different temperature range **and fit at one specific integration time**.
+Loading a calibration applies it to the live stream and sets that integration
+time together -- you do not set integration time independently. List and load:
 
 .. code-block:: python
 
@@ -100,7 +101,13 @@ different temperature range. List and select them:
         print(f"[{b['index']}] {b.get('name', '')}  "
               f"{b['tmin']:.0f}–{b['tmax']:.0f} °C{active}")
 
-    cam.set_calibration_block(0)   # select the first (coldest) range
+    cam.load_calibration(index=0)   # load the first (coldest) range;
+                                    # also sets its integration time
+
+Writing :attr:`Camera.exposure_ms` yourself desyncs the raw counts from the
+loaded calibration (temperatures read wrong) and emits a warning. After loading,
+if the image shows fixed-pattern noise, run :meth:`Camera.perform_nuc` to compute
+a fresh correction at the new integration time.
 
 Radiometric object parameters
 ------------------------------
