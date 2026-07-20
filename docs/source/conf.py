@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.abspath("../.."))
 project = "pyFlir"
 author = "Lorenzo Capponi"
 copyright = "2026, Lorenzo Capponi"
-release = "0.2.0"
+release = "0.2.1"
 extensions = [
     "sphinx.ext.autodoc",
     "sphinx.ext.napoleon",

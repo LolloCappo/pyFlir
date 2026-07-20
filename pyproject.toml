@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyFlir"
-version = "0.2.0"
+version = "0.2.1"
 description = "Pure-Python driver for FLIR thermal cameras over GigE Vision"
 readme = "PYPI_README.rst"
 license = "MIT"
