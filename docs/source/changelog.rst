@@ -4,6 +4,50 @@ Changelog
 Unreleased
 ----------
 
+- **Root cause of the wrong temperatures: the pixel data was byte-swapped.**
+  GigE Vision transmits multi-byte pixel values most-significant-byte first.
+  Decoded with the host's native little-endian order, every pixel arrives
+  byte-swapped -- not obviously broken in aggregate, but physically meaningless.
+
+  Found by reading the camera's *own* radiometry as ground truth. In
+  ``IRFormat = TemperatureLinear100mK``, pointed at a room-temperature scene,
+  the raw 1/50/99 percentiles were ``39435 / 40971 / 41995`` = ``0x9A0B /
+  0xA00B / 0xA40B``. The **low** byte is pinned at ``0x0B`` while the high byte
+  varies -- the signature of a swap, since that constant is really the *high*
+  byte of a narrow-range quantity. Byte-swapped they read ``0x0B9A / 0x0BA0 /
+  0x0BA4`` = 2970 / 2976 / 2980, and ``x0.1 - 273.15`` gives **23.9 / 24.5 /
+  24.9 °C** -- the correct room temperature. The same signature appears in
+  Radiometric mode, with the low byte pinned at ``0x15``.
+
+  This one defect explains the whole cluster of symptoms chased through this
+  release: raw values exceeding the 14-bit sensor range, counts that did not
+  scale with integration time, and blocks 0 and 1 disagreeing by ~44 °C on an
+  identical scene. It also reframes the "MSB-aligned, divide by 4" behaviour
+  below -- that divisor was compensating for swapped bytes, not recovering a
+  genuine left-shift.
+
+  ``Camera.byte_order`` (``"auto"`` / ``"native"`` / ``"swapped"``) controls
+  this; ``"auto"`` decides once from the first frame and caches the result, so
+  a later uniform scene cannot flip it mid-stream (``reset_byte_order()``
+  clears it). Detection compares byte planes: a correctly ordered image spreads
+  fine detail across all 256 low-byte values, while a swapped one collapses the
+  low byte to a handful. The thresholds sit far from genuinely MSB-aligned data,
+  which still gives the low byte 64 distinct values. pyGigEVision is unmodified
+  -- the correction lives entirely in pyflir's frame path.
+
+  **Not yet verified end-to-end**: that byte-swapping the *Radiometric* counts
+  makes blocks 0 and 1 agree and match the ~24 °C ground truth. The
+  TemperatureLinear evidence is conclusive on its own, but the full
+  counts→temperature chain still needs a live confirmation run.
+
+- **Fixed metadata-row stripping taking the wrong end of the frame.** The row
+  count was stripped from the bottom unconditionally, but on the A6751sc the
+  metadata row is the **first** row: after stripping, row 0 still held 605 zeros
+  and ~35 sparse non-zero fields (telemetry, not a dead detector row). So every
+  frame kept a row of telemetry *and* discarded a row of real pixels. The end is
+  now chosen per frame, by which candidate is the bigger outlier against the
+  frame's interior.
+
 - **Hardened raw-count identification and the calibration/integration-time
   contract**, the two things that silently corrupt temperatures:
 

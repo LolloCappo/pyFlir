@@ -775,3 +775,134 @@ class TestNuc:
             "enabled", "use_delta_temp", "delta_temp",
             "use_delta_time", "delta_time_min", "in_progress",
         }
+
+
+class TestByteOrder:
+    """Pixel byte-order normalization.
+
+    GigE Vision sends pixel data big-endian; read natively on a little-endian
+    host every value comes out byte-swapped. Verified live on the A6751sc: in
+    TemperatureLinear100mK the low byte was pinned at 0x0B while the high byte
+    varied, and byte-swapping gave 23.9-24.9 C for a room-temperature scene.
+    """
+
+    @staticmethod
+    def _scene(base=5500, spread=400, shape=(64, 64)):
+        """A plausible 14-bit scene: fine detail in the low byte."""
+        rng = np.random.default_rng(0)
+        return (base + rng.integers(0, spread, shape)).astype(np.uint16)
+
+    def test_detects_swapped_data(self):
+        native = self._scene()
+        assert not Camera._looks_byteswapped(native)
+        assert Camera._looks_byteswapped(native.byteswap())
+
+    def test_msb_aligned_data_is_not_mistaken_for_swapped(self):
+        """A genuinely left-shifted 14-bit value still gives the low byte 64
+        distinct values, well clear of the cutoff."""
+        aligned = (self._scene() << 2).astype(np.uint16)
+        assert not Camera._looks_byteswapped(aligned)
+
+    def test_auto_swaps_and_caches_decision(self):
+        cam = _make_fake_connected_camera()
+        swapped = self._scene().byteswap()
+        out = cam._normalize_byte_order(swapped)
+        assert cam._byte_order_detected == "swapped"
+        assert np.array_equal(out, swapped.byteswap())
+        # A later uniform frame must not flip the cached decision.
+        uniform = np.full((64, 64), 5500, dtype=np.uint16)
+        cam._normalize_byte_order(uniform)
+        assert cam._byte_order_detected == "swapped"
+
+    def test_explicit_override_wins(self):
+        cam = _make_fake_connected_camera()
+        frame = self._scene().byteswap()
+        cam.byte_order = "native"
+        assert np.array_equal(cam._normalize_byte_order(frame), frame)
+        cam.byte_order = "swapped"
+        assert np.array_equal(cam._normalize_byte_order(frame), frame.byteswap())
+
+    def test_reset_byte_order_forces_redetect(self):
+        cam = _make_fake_connected_camera()
+        cam._normalize_byte_order(self._scene())
+        assert cam._byte_order_detected == "native"
+        cam.reset_byte_order()
+        assert cam._byte_order_detected is None
+
+    def test_swapped_counts_fall_inside_14_bit_range(self):
+        """The point of the fix: swapped junk exceeds 14 bits, corrected data
+        does not -- which is also why the /4 'MSB alignment' divisor was only
+        ever compensating for the swap."""
+        native = self._scene()
+        assert native.max() <= 16383
+        assert native.byteswap().max() > 16383
+
+
+class TestMetadataRowPosition:
+    """The metadata row is not always trailing; stripping the wrong end keeps
+    telemetry in the image and throws away a row of real pixels."""
+
+    @staticmethod
+    def _frame(leading):
+        body = np.full((8, 16), 5000, dtype=np.uint16)
+        meta = np.zeros((1, 16), dtype=np.uint16)
+        meta[0, :3] = [7, 42, 99]          # sparse telemetry fields
+        return np.vstack([meta, body] if leading else [body, meta])
+
+    def test_strips_leading_metadata_row(self):
+        cam = _make_fake_connected_camera()
+        cam._metadata_rows = 1
+        out = cam._strip_metadata(self._frame(leading=True))
+        assert out.shape == (8, 16)
+        assert (out == 5000).all()
+        assert cam.last_metadata_rows[0, 1] == 42
+
+    def test_strips_trailing_metadata_row(self):
+        cam = _make_fake_connected_camera()
+        cam._metadata_rows = 1
+        out = cam._strip_metadata(self._frame(leading=False))
+        assert out.shape == (8, 16)
+        assert (out == 5000).all()
+        assert cam.last_metadata_rows[0, 1] == 42
+
+    def test_no_metadata_rows_is_passthrough(self):
+        cam = _make_fake_connected_camera()
+        cam._metadata_rows = 0
+        f = np.ones((4, 4), dtype=np.uint16)
+        assert np.array_equal(cam._strip_metadata(f), f)
+
+
+class TestByteOrderRegressionFromHardware:
+    """Locks in the actual A6751sc measurement that identified the defect.
+
+    Pointed at a room-temperature scene in TemperatureLinear100mK, the raw
+    1/50/99 percentiles were 0x9A0B / 0xA00B / 0xA40B -- low byte pinned at
+    0x0B. Byte-swapped they are 2970 / 2976 / 2980, which decode to the correct
+    room temperature. If this ever regresses, temperatures silently become
+    meaningless again.
+    """
+
+    OBSERVED = np.array([0x9A0B, 0xA00B, 0xA40B], dtype=np.uint16)
+
+    def test_observed_frame_is_detected_as_swapped(self):
+        """A realistic TemperatureLinear frame: the scene spans only a few
+        Kelvin, so the high byte holds just the 0x9A..0xA4 seen live while the
+        low byte stays pinned at 0x0B."""
+        rng = np.random.default_rng(0)
+        hi = rng.integers(0x9A, 0xA5, (64, 64)).astype(np.uint16)
+        frame = ((hi << 8) | 0x0B).astype(np.uint16)
+        assert Camera._looks_byteswapped(frame)
+
+    def test_uniform_frame_is_not_guessed_as_swapped(self):
+        """Both bytes constant carries no evidence either way."""
+        assert not Camera._looks_byteswapped(np.full((64, 64), 0xA00B, np.uint16))
+
+    def test_swapped_values_decode_to_room_temperature(self):
+        swapped = self.OBSERVED.byteswap().astype(np.float64)
+        assert list(swapped) == [2970, 2976, 2980]
+        celsius = swapped * reg.IR_FORMAT_KELVIN_PER_COUNT[1] - 273.15
+        assert np.allclose(celsius, [23.85, 24.45, 24.85], atol=0.01)
+
+    def test_uncorrected_values_decode_to_nonsense(self):
+        celsius = self.OBSERVED.astype(np.float64) * 0.1 - 273.15
+        assert celsius.min() > 3600      # ~3800 C, the symptom originally seen

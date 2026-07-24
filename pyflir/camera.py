@@ -218,6 +218,12 @@ class Camera:
         # NUC bad-pixel map is incomplete for an aged detector.
         self.bad_pixel_mask: np.ndarray | None = None
         self.correct_bad_pixels: bool = False
+        # Pixel byte order: "auto" (detect once from the first frame),
+        # "native", or "swapped". GigE Vision sends pixel data big-endian, so
+        # on a little-endian host the values arrive byte-swapped and are
+        # physically meaningless until corrected -- see _looks_byteswapped().
+        self.byte_order: str = "auto"
+        self._byte_order_detected: str | None = None
         # Host-side one-point radiometric offset, in 14-bit counts, applied by
         # counts_to_temperature() before the conversion. This is a last-resort
         # workaround for a residual bias against a known-temperature target;
@@ -566,14 +572,112 @@ class Camera:
     # ------------------------------------------------------------------
 
     def _strip_metadata(self, frame: np.ndarray) -> np.ndarray:
-        """Strip trailing metadata rows and cache them in last_metadata_rows."""
-        if self._metadata_rows and frame.shape[0] > self._metadata_rows:
-            self.last_metadata_rows = frame[-self._metadata_rows :]
-            return frame[: -self._metadata_rows]
+        """Strip the camera's metadata rows, caching them in last_metadata_rows.
+
+        Which end they sit on is not fixed across FLIR models, and getting it
+        wrong is quietly destructive: it keeps a row of telemetry in the image
+        *and* discards a row of real pixels. On the A6751sc the metadata row is
+        the **first** row -- stripping from the end left row 0 holding 605 zeros
+        and ~35 sparse non-zero fields, which is telemetry, not a dead detector
+        row -- so the end is chosen per frame instead of assumed.
+
+        A metadata row is overwhelmingly zeros, so it is picked out by which
+        candidate row is the bigger outlier against the interior of the frame.
+        """
+        n = self._metadata_rows
+        if not n or frame.shape[0] <= n:
+            return frame
+        interior = frame[n : frame.shape[0] - n]
+        if interior.size:
+            ref = np.median(interior)
+            top_zero = float(np.mean(frame[:n] == 0))
+            bot_zero = float(np.mean(frame[-n:] == 0))
+            if top_zero != bot_zero:
+                leading = top_zero > bot_zero
+            else:
+                # Fall back on distance from the typical pixel value.
+                leading = abs(np.median(frame[:n]) - ref) > abs(
+                    np.median(frame[-n:]) - ref
+                )
+        else:
+            leading = False
+        if leading:
+            self.last_metadata_rows = frame[:n]
+            return frame[n:]
+        self.last_metadata_rows = frame[-n:]
+        return frame[:-n]
+
+    @staticmethod
+    def _looks_byteswapped(frame: np.ndarray) -> bool:
+        """Detect big-endian pixel data read as little-endian (or vice versa).
+
+        GigE Vision transmits multi-byte pixel values most-significant-byte
+        first. Decoded with the host's native (little-endian) order, every
+        pixel comes out byte-swapped -- which is not obviously wrong-looking in
+        aggregate, but makes the values physically meaningless.
+
+        The tell is the *byte planes*. In a correctly ordered image the low byte
+        carries fine detail and takes essentially all 256 values, while the high
+        byte spans only the scene's coarse range. Swapped, that inverts: the low
+        byte holds what was really the high byte of a narrow-range quantity, so
+        it collapses to a handful of distinct values while the low byte's full
+        spread lands in the high byte.
+
+        Observed live on the A6751sc (room scene): the low byte was pinned at
+        ``0x15`` in Radiometric mode and ``0x0B`` in TemperatureLinear100mK,
+        with the high byte varying across its full range. Byte-swapping the
+        latter gave 23.9-24.9 °C, the correct room temperature.
+
+        The decision is a *ratio*, not an absolute count on the high byte: in
+        TemperatureLinear the whole scene spans only a few Kelvin, so even
+        swapped it puts just a few dozen values in the high byte. Requiring the
+        high byte to be several times richer than the low byte catches that case
+        while still rejecting a perfectly uniform frame (both bytes constant),
+        where swapping would be a guess.
+
+        The low-byte cutoff also sits well clear of genuinely MSB-aligned data:
+        a 14-bit value shifted left by 2 still gives the low byte 64 distinct
+        values -- every multiple of 4 -- far above the threshold here.
+        """
+        if frame.dtype.itemsize != 2 or frame.size < 256:
+            return False
+        flat = frame.ravel()
+        n_low = np.unique(flat & 0xFF).size
+        n_high = np.unique(flat >> 8).size
+        return n_low < 16 and n_high >= 4 * n_low
+
+    def _normalize_byte_order(self, frame: np.ndarray) -> np.ndarray:
+        """Apply :attr:`byte_order` to a freshly received frame.
+
+        In ``"auto"`` mode the decision is made once from the first frame and
+        cached, so a scene that happens to be very uniform later on cannot flip
+        it mid-stream. :meth:`reset_byte_order` clears the cache.
+        """
+        if frame.dtype.itemsize != 2:
+            return frame
+        mode = self.byte_order
+        if mode == "auto":
+            if self._byte_order_detected is None:
+                self._byte_order_detected = (
+                    "swapped" if self._looks_byteswapped(frame) else "native"
+                )
+                if self._byte_order_detected == "swapped":
+                    logger.info(
+                        "Pixel data is byte-swapped (camera sends big-endian); "
+                        "swapping on the host. Set cam.byte_order to override."
+                    )
+            mode = self._byte_order_detected
+        if mode == "swapped":
+            return frame.byteswap()
         return frame
 
+    def reset_byte_order(self) -> None:
+        """Forget the auto-detected byte order, so the next frame re-detects."""
+        self._byte_order_detected = None
+
     def _finish_frame(self, frame: np.ndarray) -> np.ndarray:
-        """Strip metadata rows, then apply bad-pixel correction if enabled."""
+        """Normalize byte order, strip metadata rows, then correct bad pixels."""
+        frame = self._normalize_byte_order(frame)
         frame = self._strip_metadata(frame)
         if self.correct_bad_pixels:
             frame, _ = replace_bad_pixels(frame, mask=self.bad_pixel_mask)
@@ -899,6 +1003,16 @@ class Camera:
         pinning every pixel at the block's tmax. A true 14-bit stream cannot
         exceed 16383, so any frame above that is Mono16 no matter what the
         register claims. Pass *frame* to enable that check.
+
+        .. note::
+
+            Call this on a byte-order-normalized frame (anything from
+            :meth:`grab`/:meth:`read` already is). Byte-swapped data also
+            exceeds 16383 and would be misread here as MSB-aligned -- on the
+            A6751sc the ``÷4`` was in fact compensating for the swap rather than
+            undoing a real left-shift, and once the bytes are correct the frame
+            falls inside 14 bits and this returns 1.0. See
+            :meth:`_looks_byteswapped`.
         """
         if frame is not None and getattr(frame, "size", 0) and int(np.max(frame)) > 16383:
             return 4.0
@@ -913,16 +1027,16 @@ class Camera:
     def to_adc_counts(self, frame: np.ndarray) -> np.ndarray:
         """Return *frame* as native 14-bit ADC counts (float).
 
-        The wire frame is a 16-bit transport word: on this camera the 14-bit ADC
-        value is left-justified (value << 2), so raw numbers run up to ~65532
-        even though the sensor is 14-bit (max 16383). **The calibration is
-        defined in ADC counts** -- ``counts_min``/``counts_max`` from
+        The wire frame is a 16-bit transport word. **The calibration is defined
+        in ADC counts** -- ``counts_min``/``counts_max`` from
         :meth:`get_calibration` are in this domain -- so this is the number that
         gets converted to temperature, not the wire value.
 
-        The division is done in floating point, so the low bits (which carry
-        sub-count precision from the camera's on-board processing, not padding)
-        are preserved as a fraction rather than truncated.
+        Pass a byte-order-normalized frame (:meth:`grab`/:meth:`read` return
+        one). With the bytes correct, a 14-bit stream already fits in 0-16383
+        and the divisor is 1; a genuinely MSB-aligned Mono16 stream is divided
+        by 4. The division is done in floating point, so any sub-count precision
+        is kept as a fraction rather than truncated.
 
         Example::
 
