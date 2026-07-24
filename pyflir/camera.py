@@ -596,9 +596,7 @@ class Camera:
                 leading = top_zero > bot_zero
             else:
                 # Fall back on distance from the typical pixel value.
-                leading = abs(np.median(frame[:n]) - ref) > abs(
-                    np.median(frame[-n:]) - ref
-                )
+                leading = abs(np.median(frame[:n]) - ref) > abs(np.median(frame[-n:]) - ref)
         else:
             leading = False
         if leading:
@@ -1522,8 +1520,7 @@ class Camera:
             time.sleep(0.1)
         else:
             raise CameraError(
-                f"NUC did not complete within {timeout}s "
-                f"(CorrectionAutoInProgress still set)."
+                f"NUC did not complete within {timeout}s (CorrectionAutoInProgress still set)."
             )
 
         duration = time.monotonic() - started
@@ -1587,17 +1584,11 @@ class Camera:
         self._require_connected()
         return {
             "enabled": bool(self._gvcp.read_reg(reg.REG_CORRECTION_AUTO_ENABLED)),
-            "use_delta_temp": bool(
-                self._gvcp.read_reg(reg.REG_CORRECTION_AUTO_USE_DELTA_TEMP)
-            ),
+            "use_delta_temp": bool(self._gvcp.read_reg(reg.REG_CORRECTION_AUTO_USE_DELTA_TEMP)),
             "delta_temp": self._gvcp.read_float(reg.REG_CORRECTION_AUTO_DELTA_TEMP),
-            "use_delta_time": bool(
-                self._gvcp.read_reg(reg.REG_CORRECTION_AUTO_USE_DELTA_TIME)
-            ),
+            "use_delta_time": bool(self._gvcp.read_reg(reg.REG_CORRECTION_AUTO_USE_DELTA_TIME)),
             "delta_time_min": self._gvcp.read_reg(reg.REG_CORRECTION_AUTO_DELTA_TIME),
-            "in_progress": bool(
-                self._gvcp.read_reg(reg.REG_CORRECTION_AUTO_IN_PROGRESS)
-            ),
+            "in_progress": bool(self._gvcp.read_reg(reg.REG_CORRECTION_AUTO_IN_PROGRESS)),
         }
 
     def get_calibration(self, block: int | None = None) -> dict:
@@ -2394,9 +2385,7 @@ def apply_calibration(
     # endpoints (a scene that over-ranges reads as a solid block of tmax). With
     # clip=False they become NaN instead, so an unsuitable calibration block is
     # visible rather than silently faked. Either way they are flagged in `status`.
-    result = (
-        np.clip(result, tmin, tmax) if clip else np.where(status == STATUS_OK, result, np.nan)
-    )
+    result = np.clip(result, tmin, tmax) if clip else np.where(status == STATUS_OK, result, np.nan)
 
     if return_status:
         return result, status

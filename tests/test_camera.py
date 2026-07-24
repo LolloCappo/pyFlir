@@ -749,9 +749,7 @@ class TestNuc:
         assert (reg.REG_CORRECTION_AUTO_DELTA_TIME, 15) in writes
         assert (reg.REG_CORRECTION_AUTO_USE_DELTA_TIME, 1) in writes
         assert (reg.REG_CORRECTION_AUTO_ENABLED, 1) in writes
-        cam._gvcp.write_float.assert_called_once_with(
-            reg.REG_CORRECTION_AUTO_DELTA_TEMP, 2.0
-        )
+        cam._gvcp.write_float.assert_called_once_with(reg.REG_CORRECTION_AUTO_DELTA_TEMP, 2.0)
 
     def test_configure_auto_nuc_leaves_untouched_triggers_alone(self):
         cam = _make_fake_connected_camera()
@@ -772,8 +770,12 @@ class TestNuc:
         assert cfg["enabled"] is True
         assert cfg["delta_temp"] == 2.5
         assert set(cfg) == {
-            "enabled", "use_delta_temp", "delta_temp",
-            "use_delta_time", "delta_time_min", "in_progress",
+            "enabled",
+            "use_delta_temp",
+            "delta_temp",
+            "use_delta_time",
+            "delta_time_min",
+            "in_progress",
         }
 
 
@@ -846,7 +848,7 @@ class TestMetadataRowPosition:
     def _frame(leading):
         body = np.full((8, 16), 5000, dtype=np.uint16)
         meta = np.zeros((1, 16), dtype=np.uint16)
-        meta[0, :3] = [7, 42, 99]          # sparse telemetry fields
+        meta[0, :3] = [7, 42, 99]  # sparse telemetry fields
         return np.vstack([meta, body] if leading else [body, meta])
 
     def test_strips_leading_metadata_row(self):
@@ -905,4 +907,4 @@ class TestByteOrderRegressionFromHardware:
 
     def test_uncorrected_values_decode_to_nonsense(self):
         celsius = self.OBSERVED.astype(np.float64) * 0.1 - 273.15
-        assert celsius.min() > 3600      # ~3800 C, the symptom originally seen
+        assert celsius.min() > 3600  # ~3800 C, the symptom originally seen
