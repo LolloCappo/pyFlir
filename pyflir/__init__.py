@@ -21,7 +21,7 @@ Quick start::
     cameras = pyflir.discover(interface_ip="169.254.100.1")
 """
 
-__version__ = "0.2.1"
+__version__ = "0.2.3"
 from pyGigEVision import GVCPClient, GVCPError, GVSPReceiver
 
 from . import io

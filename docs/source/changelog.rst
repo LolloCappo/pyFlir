@@ -4,6 +4,29 @@ Changelog
 Unreleased
 ----------
 
+Version 0.2.3 (2026-07-24)
+--------------------------
+
+The release that makes radiometry trustworthy. Two defects were corrupting every
+temperature this driver produced -- byte-swapped pixel data, and a calibration
+load that left the detector offset stale -- and both are fixed here. Read the
+warning below before upgrading: despite the patch-level version, this release
+changes the values frames carry and removes part of the NUC API.
+
+.. warning::
+
+   **Behaviour change:** frames returned by :meth:`~pyflir.Camera.grab` /
+   :meth:`~pyflir.Camera.read` now have their bytes in the correct order, so the
+   *values* differ from 0.2.x. Any hard-coded count thresholds, saved ``.npy``
+   recordings, or downstream conversions calibrated against 0.2.x output must be
+   re-derived. Recordings made with 0.2.x can be corrected after the fact with
+   ``frame.byteswap()``.
+
+   :meth:`~pyflir.Camera.load_calibration` now runs a NUC by default (the flag
+   is in the field of view for a few seconds); pass ``nuc=False`` for the old
+   behaviour. ``perform_nuc()`` and the ``correction_*`` state machine have been
+   removed -- see below for why.
+
 - **Root cause of the wrong temperatures: the pixel data was byte-swapped.**
   GigE Vision transmits multi-byte pixel values most-significant-byte first.
   Decoded with the host's native little-endian order, every pixel arrives
