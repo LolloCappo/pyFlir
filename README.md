@@ -27,8 +27,8 @@ Supported cameras:
 - **Calibration blocks**: list and load temperature-range calibrations (sets the
   matching integration time, like the vendor software)
 - **Radiometry**: emissivity, distance, atmospheric temperature, humidity
+- **One-point offset**: correct the detector offset against a known-temperature target
 - **Temperature sensors**: read all on-board thermistors
-- **NUC**: perform a fresh non-uniformity correction, flag-in-FOV / stow
 - **File I/O**: read FLIR ATS and SFMOV recorded files
 
 ## Installation
@@ -121,9 +121,10 @@ cam.load_calibration(tag="25mm, Empty, -20C - 55C") # by exact tag
 print(cam.get_calibration_block())   # index actually applied to the stream
 ```
 
-> **Note** After loading a calibration, the image may show fixed-pattern noise
-> if the stored NUC is stale for the new integration time. Run `cam.perform_nuc()`
-> to compute a fresh correction (see below).
+> **Note** Loading a calibration changes the integration time, which can shift
+> the detector offset so a uniform surface reads too hot by a constant. The
+> conversion is still correct — use `set_offset_reference()` (below) to remove
+> the offset, or simply leave the camera in its factory-booted calibration.
 
 ## Radiometry
 
@@ -159,32 +160,24 @@ for name, celsius in cam.get_temperatures().items():
     print(f"{name}: {celsius:.1f} °C")
 ```
 
-## NUC and flag
+## One-point offset
+
+pyFlir does not manage the camera's on-board NUC (that stays as the camera boots
+it). The calibration conversion is exact, but the detector offset can leave a
+uniform surface reading too hot by a constant. Correct it against a target whose
+temperature you know:
 
 ```python
-cam.perform_nuc()                  # compute a fresh correction now
-                                    # (blocks until done; uses the internal
-                                    # flag automatically, no user action needed)
+# Point the camera at a known-temperature target filling the centre
+# (your hand ~34 °C, a wall you measured, iced water 0 °C), then:
+off = cam.set_offset_reference(34.0)   # measures the shift, stores it
+print("count offset:", round(off))
 
-print(cam.get_nuc_status())        # {"name": "..."} -- what's currently loaded
-print(cam.has_flag())              # does this camera have a physical flag?
-print(cam.get_flag_state())        # "Stowed" or "InFOV"
+temp = cam.frame_to_celsius(cam.grab())  # now reads correctly
 ```
 
-For a two-point correction or an external blackbody target (needs a person
-to present it and confirm), drive the state machine directly instead of
-`perform_nuc()`:
-
-```python
-cam.correction_start(correction_type="TwoPoint", source="External")
-# ... present the first uniform target, then:
-cam.correction_continue()
-# ... present the second uniform target, then:
-cam.correction_continue()
-print(cam.get_correction_status())
-print(cam.get_correction_result())
-cam.correction_accept()            # or correction_discard() / correction_abort()
-```
+The offset holds for the session; re-run it if you change the calibration block
+or integration time.
 
 ## Live streaming
 

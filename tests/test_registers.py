@@ -10,10 +10,6 @@ class TestRegisterAddresses:
         assert reg.REG_CAL_INDEX == 0x4E062404
         assert reg.REG_CAL_INDEX_MAX == 0x4E062408
 
-    def test_nuc_load_dict_populated(self):
-        assert isinstance(reg.REG_NUC_LOAD, dict)
-        assert len(reg.REG_NUC_LOAD) > 0
-
     def test_calibration_load_dicts(self):
         # One entry per preset (0-3), addresses distinct.
         for d in (
@@ -28,15 +24,16 @@ class TestRegisterAddresses:
         assert reg.REG_PS_CALIBRATION_LOAD[0] == 0x4E05A5E0
         assert reg.REG_ACTIVE_PRESET == 0x4E05882C
 
+    def test_ir_format_registers(self):
+        assert reg.REG_IR_FORMAT == 0x4E064E00
+        assert reg.IR_FORMAT_NAMES[0] == "Radiometric"
+        assert reg.IR_FORMAT_KELVIN_PER_COUNT[2] == 0.01
+
     def test_roi_registers_exist(self):
         assert hasattr(reg, "REG_OFFSET_X")
         assert hasattr(reg, "REG_OFFSET_Y")
         assert hasattr(reg, "REG_WIDTH_MIN")
         assert hasattr(reg, "REG_HEIGHT_MIN")
-
-    def test_flag_registers_exist(self):
-        assert hasattr(reg, "REG_FLAG_STOWED")
-        assert hasattr(reg, "REG_FLAG_IN_FOV")
 
     def test_temperature_sensors_dict(self):
         assert isinstance(reg.TEMP_SENSORS, dict)

@@ -273,215 +273,6 @@ class TestTemperatureSensors:
             _ = cam.detector_temperature
 
 
-class TestNucAndFlag:
-    """Unit tests for get_nuc_status and the NUC flag."""
-
-    def test_get_nuc_status_reads_correction_name(self):
-        cam = _make_fake_connected_camera()
-        cam._gvcp.read_mem.return_value = b"FactoryDefault" + b"\x00" * (256 - 14)
-        status = cam.get_nuc_status(preset=0)
-        assert status == {"name": "FactoryDefault"}
-        cam._gvcp.read_mem.assert_called_once_with(reg.REG_CORRECTION_NAME[0], 256)
-
-    def test_get_nuc_status_invalid_preset_raises(self):
-        cam = _make_fake_connected_camera()
-        with pytest.raises(CameraError, match="preset"):
-            cam.get_nuc_status(preset=5)
-
-    def test_has_flag_true(self):
-        cam = _make_fake_connected_camera()
-        cam._gvcp.read_reg.return_value = 1
-        assert cam.has_flag() is True
-
-    def test_has_flag_false(self):
-        cam = _make_fake_connected_camera()
-        cam._gvcp.read_reg.return_value = 0
-        assert cam.has_flag() is False
-
-    def test_get_flag_state_stowed(self):
-        cam = _make_fake_connected_camera()
-        cam._gvcp.read_reg.side_effect = lambda addr: 1 if addr == reg.REG_FLAG_PRESENT else 0
-        assert cam.get_flag_state() == "Stowed"
-
-    def test_get_flag_state_in_fov(self):
-        cam = _make_fake_connected_camera()
-        cam._gvcp.read_reg.side_effect = lambda addr: (
-            1 if addr in (reg.REG_FLAG_PRESENT, reg.REG_FLAG_STATE) else 0
-        )
-        assert cam.get_flag_state() == "InFOV"
-
-    def test_get_flag_state_no_flag_raises(self):
-        cam = _make_fake_connected_camera()
-        cam._gvcp.read_reg.return_value = 0
-        with pytest.raises(CameraError, match="no NUC flag"):
-            cam.get_flag_state()
-
-
-class TestCorrectionPerform:
-    """Unit tests for the CorrectionPerform state machine (correction_start,
-    get_correction_status/result, correction_accept/discard/abort, and the
-    high-level perform_nuc())."""
-
-    def test_get_correction_status_reads_enum_and_text(self):
-        cam = _make_fake_connected_camera()
-        cam._gvcp.read_reg.return_value = 4  # CollectingFirstSource
-        cam._gvcp.read_mem.return_value = b"collecting..." + b"\x00" * (256 - 13)
-        status = cam.get_correction_status()
-        assert status == {"status": "CollectingFirstSource", "text": "collecting..."}
-
-    def test_get_correction_result_reads_enum_and_text(self):
-        cam = _make_fake_connected_camera()
-        cam._gvcp.read_reg.return_value = 0  # Okay
-        cam._gvcp.read_mem.return_value = b"done" + b"\x00" * (256 - 4)
-        result = cam.get_correction_result()
-        assert result == {"result": "Okay", "text": "done"}
-
-    def test_correction_start_writes_type_source_presets_and_start(self):
-        cam = _make_fake_connected_camera()
-        cam.correction_start(preset=2, correction_type="TwoPoint", source="External")
-
-        calls = {
-            addr: value for addr, value in (c.args for c in cam._gvcp.write_reg.call_args_list)
-        }
-        assert calls[reg.REG_CORRECTION_TYPE] == 1  # TwoPoint
-        assert calls[reg.REG_CORRECTION_SOURCE] == 0  # External
-        assert calls[reg.REG_CORRECTION_PS[0]] == 0
-        assert calls[reg.REG_CORRECTION_PS[1]] == 0
-        assert calls[reg.REG_CORRECTION_PS[2]] == 1
-        assert calls[reg.REG_CORRECTION_PS[3]] == 0
-        assert calls[reg.REG_CORRECTION_START] == 1
-
-    def test_correction_start_invalid_preset_raises(self):
-        cam = _make_fake_connected_camera()
-        with pytest.raises(CameraError, match="preset"):
-            cam.correction_start(preset=9)
-
-    def test_correction_start_invalid_type_raises(self):
-        cam = _make_fake_connected_camera()
-        with pytest.raises(CameraError, match="correction_type"):
-            cam.correction_start(correction_type="ThreePoint")
-
-    def test_correction_start_invalid_source_raises(self):
-        cam = _make_fake_connected_camera()
-        with pytest.raises(CameraError, match="source"):
-            cam.correction_start(source="Sideways")
-
-    def test_correction_continue_writes_register(self):
-        cam = _make_fake_connected_camera()
-        cam.correction_continue()
-        cam._gvcp.write_reg.assert_called_once_with(reg.REG_CORRECTION_CONTINUE, 1)
-
-    def test_correction_accept_writes_register(self):
-        cam = _make_fake_connected_camera()
-        cam.correction_accept()
-        cam._gvcp.write_reg.assert_called_once_with(reg.REG_CORRECTION_ACCEPT, 1)
-
-    def test_correction_discard_writes_register(self):
-        cam = _make_fake_connected_camera()
-        cam.correction_discard()
-        cam._gvcp.write_reg.assert_called_once_with(reg.REG_CORRECTION_DISCARD, 1)
-
-    def test_correction_abort_writes_register(self):
-        cam = _make_fake_connected_camera()
-        cam.correction_abort()
-        cam._gvcp.write_reg.assert_called_once_with(reg.REG_CORRECTION_ABORT, 1)
-
-
-class TestPerformNuc:
-    """Unit tests for the high-level perform_nuc() convenience method."""
-
-    def _cam_with_status_sequence(self, statuses, result=0, result_text="Okay"):
-        """Return a fake connected camera whose CorrectionStatus reads walk
-        through *statuses* (list of status enum ints) then hold on the last
-        one forever; CorrectionResult/ResultText are fixed."""
-        cam = _make_fake_connected_camera()
-        cam._gvcp.read_reg.return_value = 1  # has_flag() -> True by default
-
-        status_iter = iter(statuses)
-        remaining = {"status": None}
-
-        def fake_read_reg(addr):
-            if addr == reg.REG_FLAG_PRESENT:
-                return 1
-            if addr == reg.REG_CORRECTION_STATUS:
-                remaining["status"] = next(status_iter, remaining["status"])
-                return remaining["status"]
-            if addr == reg.REG_CORRECTION_RESULT:
-                return result
-            return 0
-
-        cam._gvcp.read_reg.side_effect = fake_read_reg
-
-        def fake_read_mem(addr, length):
-            if addr == reg.REG_CORRECTION_RESULT_TEXT:
-                return result_text.encode("ascii") + b"\x00" * (256 - len(result_text))
-            return b"\x00" * length
-
-        cam._gvcp.read_mem.side_effect = fake_read_mem
-        return cam
-
-    def test_happy_path_auto_accept(self):
-        # Starting(13) -> WaitingForFirstSourceInternal(3) -> CollectingFirstSource(4) -> Ready(0)
-        cam = self._cam_with_status_sequence([13, 3, 4, 0], result=0, result_text="Okay")
-        with patch("pyflir.camera.time.sleep"):
-            result = cam.perform_nuc(preset=0, timeout=5.0, poll_interval=0.0)
-
-        assert result == {"result": "Okay", "text": "Okay"}
-        write_calls = [c.args for c in cam._gvcp.write_reg.call_args_list]
-        assert (reg.REG_CORRECTION_SOURCE, 1) in write_calls  # Internal
-        assert (reg.REG_CORRECTION_START, 1) in write_calls
-        assert (reg.REG_CORRECTION_ACCEPT, 1) in write_calls
-
-    def test_auto_accept_false_does_not_accept(self):
-        cam = self._cam_with_status_sequence([0], result=0, result_text="Okay")
-        with patch("pyflir.camera.time.sleep"):
-            result = cam.perform_nuc(timeout=5.0, poll_interval=0.0, auto_accept=False)
-
-        assert result["result"] == "Okay"
-        write_calls = [c.args for c in cam._gvcp.write_reg.call_args_list]
-        assert (reg.REG_CORRECTION_ACCEPT, 1) not in write_calls
-
-    def test_no_flag_raises_before_starting(self):
-        cam = _make_fake_connected_camera()
-        cam._gvcp.read_reg.return_value = 0  # has_flag() -> False
-        with pytest.raises(CameraError, match="no NUC flag"):
-            cam.perform_nuc()
-        cam._gvcp.write_reg.assert_not_called()
-
-    def test_two_point_rejected(self):
-        cam = _make_fake_connected_camera()
-        cam._gvcp.read_reg.return_value = 1  # has_flag() -> True
-        with pytest.raises(CameraError, match="TwoPoint"):
-            cam.perform_nuc(correction_type="TwoPoint")
-        cam._gvcp.write_reg.assert_not_called()
-
-    def test_non_okay_result_raises_and_does_not_accept(self):
-        cam = self._cam_with_status_sequence([0], result=1, result_text="user cancelled")
-        with patch("pyflir.camera.time.sleep"), pytest.raises(CameraError, match="Abort"):
-            cam.perform_nuc(timeout=5.0, poll_interval=0.0)
-
-        write_calls = [c.args for c in cam._gvcp.write_reg.call_args_list]
-        assert (reg.REG_CORRECTION_ACCEPT, 1) not in write_calls
-
-    def test_unexpected_external_wait_aborts_and_raises(self):
-        # Camera asks for an external source despite source=Internal being requested.
-        cam = self._cam_with_status_sequence([2])  # WaitingForFirstSourceExternal
-        with patch("pyflir.camera.time.sleep"), pytest.raises(CameraError, match="external"):
-            cam.perform_nuc(timeout=5.0, poll_interval=0.0)
-
-        write_calls = [c.args for c in cam._gvcp.write_reg.call_args_list]
-        assert (reg.REG_CORRECTION_ABORT, 1) in write_calls
-
-    def test_timeout_aborts_and_raises(self):
-        # Status never reaches Ready.
-        cam = self._cam_with_status_sequence([13, 3, 4])  # holds on CollectingFirstSource
-        with patch("pyflir.camera.time.sleep"), pytest.raises(CameraError, match="timed out"):
-            cam.perform_nuc(timeout=0.02, poll_interval=0.0)
-
-        write_calls = [c.args for c in cam._gvcp.write_reg.call_args_list]
-        assert (reg.REG_CORRECTION_ABORT, 1) in write_calls
-
-
 class TestLoadCalibration:
     """Unit tests for load_calibration(), _write_string_reg(), and the
     active-calibration tag matching used by get_calibration_block()."""
@@ -509,11 +300,42 @@ class TestLoadCalibration:
             patch.object(cam, "_read_string", return_value="TAG"),
             patch.object(cam, "read_float", return_value=2.354),
         ):
-            res = cam.load_calibration(tag="TAG")
+            res = cam.load_calibration(tag="TAG", nuc=False)
         mock_ws.assert_called_once_with(reg.REG_PS_CALIBRATION_LOAD_TAG[0], "TAG")
         write_calls = [c.args for c in cam._gvcp.write_reg.call_args_list]
         assert (reg.REG_PS_CALIBRATION_LOAD[0], 1) in write_calls
-        assert res == {"preset": 0, "tag": "TAG", "exposure_ms": 2.354}
+        assert res == {"preset": 0, "tag": "TAG", "exposure_ms": 2.354, "nuc": None}
+
+    def test_load_calibration_runs_nuc_by_default(self):
+        """Loading changes the integration time, so the offset must be
+        re-levelled afterwards -- that is what the vendor software does on
+        range select, and skipping it is what made block switches read wrong."""
+        cam = _make_fake_connected_camera()
+        cam._gvcp.read_reg.return_value = 0
+        with (
+            patch.object(cam, "_write_string_reg"),
+            patch.object(cam, "_read_string", return_value="TAG"),
+            patch.object(cam, "read_float", return_value=2.354),
+            patch.object(cam, "nuc", return_value={"duration_s": 5.0}) as mock_nuc,
+        ):
+            res = cam.load_calibration(tag="TAG")
+        mock_nuc.assert_called_once()
+        assert res["nuc"] == {"duration_s": 5.0}
+
+    def test_load_calibration_survives_failing_nuc(self):
+        """A NUC failure still leaves a valid calibration loaded, so report it
+        rather than discarding a successful load."""
+        cam = _make_fake_connected_camera()
+        cam._gvcp.read_reg.return_value = 0
+        with (
+            patch.object(cam, "_write_string_reg"),
+            patch.object(cam, "_read_string", return_value="TAG"),
+            patch.object(cam, "read_float", return_value=2.354),
+            patch.object(cam, "nuc", side_effect=CameraError("no flag")),
+        ):
+            res = cam.load_calibration(tag="TAG")
+        assert res["tag"] == "TAG"
+        assert res["nuc"] is None
 
     def test_load_calibration_by_index_resolves_and_restores_cursor(self):
         cam = _make_fake_connected_camera()
@@ -590,6 +412,56 @@ class TestLoadCalibration:
 
         with patch.object(cam, "_read_string", side_effect=read_string):
             assert cam.get_calibration_block() == 1
+
+
+class TestPixelFormatDivisor:
+    """The count divisor adapts to the transport pixel format (14-bit sensor)."""
+
+    def test_mono16_divisor_is_4(self):
+        cam = _make_fake_connected_camera()
+        with patch.object(cam, "read_enum", return_value="Mono16"):
+            assert cam._count_divisor() == 4.0
+
+    def test_mono14_divisor_is_1(self):
+        cam = _make_fake_connected_camera()
+        with patch.object(cam, "read_enum", return_value="Mono14"):
+            assert cam._count_divisor() == 1.0
+
+    def test_divisor_defaults_to_4_on_error(self):
+        cam = _make_fake_connected_camera()
+        with patch.object(cam, "read_enum", side_effect=RuntimeError):
+            assert cam._count_divisor() == 4.0
+
+    def test_data_overrides_a_lying_pixel_format_register(self):
+        # The camera accepts PixelFormat=Mono14 while still streaming Mono16.
+        # A true 14-bit stream cannot exceed 16383, so data above that must be
+        # Mono16 (divisor 4) regardless of what the register claims -- otherwise
+        # counts go in 4x too high and every pixel pins at the block's tmax.
+        cam = _make_fake_connected_camera()
+        with patch.object(cam, "read_enum", return_value="Mono14"):
+            mono16 = np.full((4, 4), 48919, dtype=np.uint16)
+            assert cam._count_divisor(mono16) == 4.0
+            real14 = np.full((4, 4), 8645, dtype=np.uint16)
+            assert cam._count_divisor(real14) == 1.0
+
+    def test_apply_calibration_respects_divisor(self):
+        cal = {
+            "counts_min": 1985,
+            "counts_max": 13618,
+            "tmin": 10.0,
+            "tmax": 90.0,
+            "counts_background": 0.0,
+            "counts_coeffs": [-8.19e-05, 9.29e-08, 4.46e-13],
+            "temp_coeffs": [-21.72, 400064, -1.0e9, 1.6e12, -1.43e15, 6.57e17, -1.2e20],
+        }
+        frame = np.full((4, 4), 8000, dtype=np.uint16)
+        from pyflir import apply_calibration
+
+        # Mono16: 8000/4 = 2000 counts -> near tmin; Mono14: 8000 counts -> hot.
+        t16 = float(np.median(apply_calibration(frame, cal, count_divisor=4.0)))
+        t14 = float(np.median(apply_calibration(frame, cal, count_divisor=1.0)))
+        assert t16 < 20.0
+        assert t14 > 60.0
 
 
 class TestPropertiesWithMock:
@@ -751,3 +623,155 @@ class TestHardwareGrab:
         frames = cam.acquire(5, timeout=15.0)
         assert len(frames) == 5
         assert all(f.shape == frames[0].shape for f in frames)
+
+
+class TestIntegrationTimeGuard:
+    """A calibration is only valid at its own integration time."""
+
+    def test_warns_when_integration_diverges_from_calibration(self):
+        cam = _make_fake_connected_camera()
+        cam._cal_integration_ms = 2.354
+        with (
+            patch.object(cam, "read_float", return_value=4.0),  # exposure now 4.0 ms
+            patch.object(cam, "get_calibration", return_value={}),
+            patch("pyflir.camera.apply_calibration", return_value=np.zeros((2, 2))),
+            patch.object(cam, "get_object_params", side_effect=RuntimeError),
+            pytest.warns(UserWarning, match="no longer matches"),
+        ):
+            cam.counts_to_temperature(np.zeros((2, 2), dtype=np.uint16))
+
+    def test_no_warning_when_integration_matches(self):
+        import warnings as _w
+
+        cam = _make_fake_connected_camera()
+        cam._cal_integration_ms = 2.354
+        with (
+            patch.object(cam, "read_float", return_value=2.354),
+            patch.object(cam, "get_calibration", return_value={}),
+            patch("pyflir.camera.apply_calibration", return_value=np.zeros((2, 2))),
+            patch.object(cam, "get_object_params", side_effect=RuntimeError),
+            _w.catch_warnings(record=True) as caught,
+        ):
+            _w.simplefilter("always")
+            cam.counts_to_temperature(np.zeros((2, 2), dtype=np.uint16))
+        assert not [x for x in caught if "no longer matches" in str(x.message)]
+
+
+class TestToAdcCounts:
+    """The 14-bit ADC domain is what the calibration is defined in."""
+
+    def test_mono16_wire_value_divided_by_4(self):
+        cam = _make_fake_connected_camera()
+        frame = np.full((2, 2), 65304, dtype=np.uint16)  # wire, 16-bit
+        with patch.object(cam, "read_enum", return_value="Mono16"):
+            adc = cam.to_adc_counts(frame)
+        assert np.allclose(adc, 16326.0)  # within 14-bit range
+        assert adc.max() <= 16383
+
+    def test_sub_count_precision_preserved(self):
+        # Low bits carry sub-count precision, not padding -> keep the fraction.
+        cam = _make_fake_connected_camera()
+        frame = np.full((2, 2), 65305, dtype=np.uint16)
+        with patch.object(cam, "read_enum", return_value="Mono16"):
+            adc = cam.to_adc_counts(frame)
+        assert np.allclose(adc, 16326.25)
+
+
+class TestNuc:
+    """Unit tests for nuc() and the automatic-NUC configuration.
+
+    pyflir drives only the camera's *offset update* path
+    (CorrectionAutoPerform). The lower-level CorrectionPerform state machine
+    recomputes the stored gain coefficients and corrupts the image when run
+    against the internal flag, so it is deliberately not exposed -- see the
+    comment above REG_CORRECTION_AUTO_ENABLED in pyflir.registers.
+    """
+
+    def test_nuc_triggers_and_polls_to_completion(self):
+        cam = _make_fake_connected_camera()
+        busy = iter([1, 1, 1, 0])  # in-progress for three polls, then done
+
+        def read_reg(addr):
+            if addr == reg.REG_FLAG_PRESENT:
+                return 1
+            if addr == reg.REG_CORRECTION_AUTO_IN_PROGRESS:
+                return next(busy, 0)
+            if addr == reg.REG_FLAG_STATE:
+                return 0  # Stowed
+            return 0
+
+        cam._gvcp.read_reg.side_effect = read_reg
+        res = cam.nuc(settle=0)
+        writes = [c.args for c in cam._gvcp.write_reg.call_args_list]
+        assert (reg.REG_CORRECTION_AUTO_PERFORM, 1) in writes
+        assert res["flag_state"] == "Stowed"
+        assert res["duration_s"] >= 0
+
+    def test_nuc_never_touches_the_destructive_correction_registers(self):
+        """Regression guard: running a NUC must not write CorrectionStart,
+        CorrectionType or CorrectionAccept -- those overwrite the factory gain
+        terms and visibly corrupt the image."""
+        cam = _make_fake_connected_camera()
+        cam._gvcp.read_reg.side_effect = lambda a: 1 if a == reg.REG_FLAG_PRESENT else 0
+        with patch("pyflir.camera.NUC_START_GRACE_S", 0.1):
+            cam.nuc(settle=0)
+        written = {c.args[0] for c in cam._gvcp.write_reg.call_args_list}
+        assert written.isdisjoint({0x4E060C00, 0x4E060C08, 0x4E060C14, 0x4E060C0C})
+        assert not any(hasattr(cam, n) for n in ("perform_nuc", "correction_start"))
+
+    def test_nuc_without_flag_raises(self):
+        cam = _make_fake_connected_camera()
+        cam._gvcp.read_reg.return_value = 0  # FlagPresent = 0
+        with pytest.raises(CameraError, match="no NUC flag"):
+            cam.nuc(settle=0)
+
+    def test_nuc_times_out_if_never_finishes(self):
+        cam = _make_fake_connected_camera()
+        cam._gvcp.read_reg.side_effect = lambda a: 1  # always busy
+        with pytest.raises(CameraError, match="did not complete"):
+            cam.nuc(timeout=0.3, settle=0)
+
+    def test_nuc_completes_when_busy_flag_never_latches(self):
+        """The in-progress bit may not be observable for a very fast update;
+        that must not hang the call."""
+        cam = _make_fake_connected_camera()
+        cam._gvcp.read_reg.side_effect = lambda a: 1 if a == reg.REG_FLAG_PRESENT else 0
+        with patch("pyflir.camera.NUC_START_GRACE_S", 0.2):
+            res = cam.nuc(timeout=10, settle=0)
+        assert res["duration_s"] < 10
+
+    def test_configure_auto_nuc_sets_triggers_and_enables(self):
+        cam = _make_fake_connected_camera()
+        cam._gvcp.read_float.return_value = 2.0
+        cam.configure_auto_nuc(enabled=True, delta_temp=2.0, delta_time_min=15)
+        writes = [c.args for c in cam._gvcp.write_reg.call_args_list]
+        assert (reg.REG_CORRECTION_AUTO_USE_DELTA_TEMP, 1) in writes
+        assert (reg.REG_CORRECTION_AUTO_DELTA_TIME, 15) in writes
+        assert (reg.REG_CORRECTION_AUTO_USE_DELTA_TIME, 1) in writes
+        assert (reg.REG_CORRECTION_AUTO_ENABLED, 1) in writes
+        cam._gvcp.write_float.assert_called_once_with(
+            reg.REG_CORRECTION_AUTO_DELTA_TEMP, 2.0
+        )
+
+    def test_configure_auto_nuc_leaves_untouched_triggers_alone(self):
+        cam = _make_fake_connected_camera()
+        cam._gvcp.read_float.return_value = 2.0
+        cam.configure_auto_nuc(enabled=False)
+        writes = [c.args for c in cam._gvcp.write_reg.call_args_list]
+        assert (reg.REG_CORRECTION_AUTO_ENABLED, 0) in writes
+        assert not cam._gvcp.write_float.called
+        touched = {a for a, _ in writes}
+        assert reg.REG_CORRECTION_AUTO_USE_DELTA_TEMP not in touched
+        assert reg.REG_CORRECTION_AUTO_USE_DELTA_TIME not in touched
+
+    def test_get_auto_nuc_config_shape(self):
+        cam = _make_fake_connected_camera()
+        cam._gvcp.read_reg.return_value = 1
+        cam._gvcp.read_float.return_value = 2.5
+        cfg = cam.get_auto_nuc_config()
+        assert cfg["enabled"] is True
+        assert cfg["delta_temp"] == 2.5
+        assert set(cfg) == {
+            "enabled", "use_delta_temp", "delta_temp",
+            "use_delta_time", "delta_time_min", "in_progress",
+        }

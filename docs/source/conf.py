@@ -23,7 +23,7 @@ llms_txt_summary = (
     "with no vendor SDK required. It speaks GVCP and GVSP directly over UDP (on "
     "top of pyGigEVision) to discover cameras, download and parse GenICam XML, "
     "configure frame rate, exposure, ROI, calibration blocks, and radiometric "
-    "parameters, stream live frames, and trigger NUC corrections."
+    "parameters, and stream live frames."
 )
 
 templates_path = ["_templates"]

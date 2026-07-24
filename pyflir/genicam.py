@@ -124,6 +124,24 @@ def parse_genicam_xml(xml_bytes: bytes) -> dict[str, RegNode]:
 
             nodes[name] = node
 
+    # An Enumeration usually carries the entry name->value map but has no
+    # <Address> of its own (it references its backing register via <pValue>), so
+    # the address-required loop above skipped it -- leaving the register node
+    # (which HAS the address) with no entries. Copy each Enumeration's entries
+    # onto its backing register so read_enum()/write_enum() can map names both
+    # ways. Without this, e.g. read_enum("PixelFormat") returns "<unknown:N>"
+    # and write_enum("PixelFormat", "Mono14") wrongly rejects a valid value.
+    for elem in root.iter(_tag("Enumeration")):
+        pval = _child_text(elem, "pValue")
+        if not pval or pval not in nodes:
+            continue
+        target = nodes[pval]
+        for entry in elem.iter(_tag("EnumEntry")):
+            entry_name = entry.get("Name", "")
+            val = _int(_child_text(entry, "Value"))
+            if entry_name and val is not None:
+                target.enum_entries.setdefault(entry_name, val)
+
     return nodes
 
 

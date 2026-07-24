@@ -2,7 +2,8 @@
 
 Provides a Pythonic interface to FLIR Xsc-series and A-series cameras
 using pyGigEVision for the transport layer. Handles discovery, streaming,
-frame acquisition, ROI, calibration block selection, NUC, and diagnostics.
+frame acquisition, ROI, calibration block selection, non-uniformity
+correction, radiometric conversion, and diagnostics.
 
 Usage::
 
@@ -42,6 +43,12 @@ logger = logging.getLogger(__name__)
 
 # Default MTU-safe packet size for 1 GbE without jumbo frames
 DEFAULT_PACKET_SIZE = 1500
+
+# How long Camera.nuc() waits for CorrectionAutoInProgress to go high before
+# concluding the update was too quick to observe. Without this it would return
+# immediately on the first read, since the bit is not guaranteed to have
+# latched yet; with it, "never went busy" is treated as done rather than hung.
+NUC_START_GRACE_S = 2.0
 
 # SFNC → FLIR-camera-specific feature name aliases.
 # Populated by load_xml() after inspecting available node names.
@@ -205,6 +212,24 @@ class Camera:
         # the last_metadata_rows attribute after each acquisition.
         self._metadata_rows: int = 0
         self.last_metadata_rows: np.ndarray | None = None
+        # Optional software bad-pixel replacement. When correct_bad_pixels is
+        # True, grab()/read() interpolate over pixels flagged in bad_pixel_mask
+        # (built by detect_bad_pixels()). Fills the gap when the camera's own
+        # NUC bad-pixel map is incomplete for an aged detector.
+        self.bad_pixel_mask: np.ndarray | None = None
+        self.correct_bad_pixels: bool = False
+        # Host-side one-point radiometric offset, in 14-bit counts, applied by
+        # counts_to_temperature() before the conversion. This is a last-resort
+        # workaround for a residual bias against a known-temperature target;
+        # the supported fix for a counts offset is Camera.nuc(), which corrects
+        # it on the camera where it belongs. 0.0 = no correction.
+        self.count_offset: float = 0.0
+        # Integration time (ms) that the currently loaded calibration was fit at,
+        # recorded by load_calibration(). A calibration is only valid at its own
+        # integration time -- counts scale with it -- so counts_to_temperature()
+        # warns if the two have since diverged. None = unknown (nothing loaded
+        # through load_calibration this session).
+        self._cal_integration_ms: float | None = None
 
     # ------------------------------------------------------------------
     # Context manager
@@ -547,6 +572,69 @@ class Camera:
             return frame[: -self._metadata_rows]
         return frame
 
+    def _finish_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Strip metadata rows, then apply bad-pixel correction if enabled."""
+        frame = self._strip_metadata(frame)
+        if self.correct_bad_pixels:
+            frame, _ = replace_bad_pixels(frame, mask=self.bad_pixel_mask)
+        return frame
+
+    def detect_bad_pixels(
+        self,
+        n_frames: int = 30,
+        timeout: float = 2.0,
+        dead_fraction: float = 0.5,
+        twinkle_sigma: float = 10.0,
+    ) -> int:
+        """Build a bad-pixel mask by observing the live stream.
+
+        Streams *n_frames* and flags pixels that are (a) stuck at/below zero in
+        at least *dead_fraction* of frames (dead) or (b) far noisier over time
+        than typical (twinkling), storing the result in
+        :attr:`bad_pixel_mask`. Set :attr:`correct_bad_pixels` to ``True``
+        afterwards to have :meth:`grab`/:meth:`read` interpolate over them.
+
+        Point the camera at a normal scene (not a uniform blackbody) so dead
+        pixels stand out. This complements the camera's on-board NUC bad-pixel
+        map, which can be incomplete on an aged detector (observed live: the
+        NUC listed ~10 bad pixels while ~600 were actually dead).
+
+        Args:
+            n_frames: Frames to average for detection.
+            timeout: Per-frame read timeout in seconds.
+            dead_fraction: Fraction of frames a pixel must read <= 0 to count
+                as dead.
+            twinkle_sigma: A pixel is flagged twinkling if its temporal std
+                (global DC removed) exceeds this many times the median.
+
+        Returns:
+            Number of pixels flagged.
+        """
+        self._require_connected()
+        prev = self.correct_bad_pixels
+        self.correct_bad_pixels = False  # detect on raw frames
+        was_streaming = self._streaming
+        if not was_streaming:
+            self.start_stream()
+        try:
+            for _ in range(min(10, n_frames)):
+                self.read(timeout=timeout)
+            frames = np.stack(
+                [self.read(timeout=timeout).astype(np.float64) for _ in range(n_frames)]
+            )
+        finally:
+            if not was_streaming:
+                self.stop_stream()
+            self.correct_bad_pixels = prev
+
+        dead = (frames <= 0).mean(axis=0) >= dead_fraction
+        dc = frames.mean(axis=(1, 2), keepdims=True)
+        tstd = (frames - dc).std(axis=0)
+        med = float(np.median(tstd))
+        twinkle = tstd > max(50.0, twinkle_sigma * med)
+        self.bad_pixel_mask = dead | twinkle
+        return int(self.bad_pixel_mask.sum())
+
     def grab(self, timeout: float = 5.0) -> np.ndarray:
         """Start streaming, capture one frame, stop streaming, and return it.
 
@@ -595,7 +683,7 @@ class Camera:
                     "  • SC_PACKET_SIZE ≤ network MTU\n"
                     "  • Camera is not in trigger mode"
                 )
-            return self._strip_metadata(frame)
+            return self._finish_frame(frame)
 
         frame = self._gvsp.get_frame(timeout=timeout)
         if frame is None:
@@ -605,7 +693,7 @@ class Camera:
                 "  • SC_PACKET_SIZE ≤ network MTU\n"
                 "  • Camera is not in trigger mode"
             )
-        return self._strip_metadata(frame)
+        return self._finish_frame(frame)
 
     def acquire(self, n_frames: int, timeout: float = 30.0) -> list[np.ndarray]:
         """Capture exactly ``n_frames`` frames and return them as a list.
@@ -636,7 +724,7 @@ class Camera:
                     )
                 frame = self._gvsp.get_frame(timeout=min(remaining, 2.0))
                 if frame is not None:
-                    frames.append(self._strip_metadata(frame))
+                    frames.append(self._finish_frame(frame))
             return frames
         finally:
             if managed:
@@ -719,6 +807,180 @@ class Camera:
     def frame_rate_max(self) -> float | None:
         """Maximum frame rate for the current ROI (read-only, from camera)."""
         return self.get_max_frame_rate()
+
+    @property
+    def ir_format(self) -> str:
+        """What the camera streams: ``"Radiometric"`` (raw counts) or a
+        ``"TemperatureLinear10mK"``/``"TemperatureLinear100mK"`` mode.
+
+        In a TemperatureLinear mode the camera does all radiometry on-board
+        (its own NUC, calibration, and object parameters) and streams
+        temperature directly -- ``frame_to_celsius()`` then just rescales, no
+        polynomial needed. Requires a factory calibration to be loaded first
+        (see :meth:`load_calibration`).
+        """
+        self._require_connected()
+        raw = self._gvcp.read_reg(reg.REG_IR_FORMAT)
+        return reg.IR_FORMAT_NAMES.get(raw, f"<unknown:{raw}>")
+
+    @ir_format.setter
+    def ir_format(self, mode: "str | int") -> None:
+        self._require_connected()
+        if isinstance(mode, str):
+            if mode not in reg.IR_FORMAT_VALUES:
+                raise CameraError(
+                    f"Unknown IR format {mode!r}; expected one of {list(reg.IR_FORMAT_VALUES)}."
+                )
+            val = reg.IR_FORMAT_VALUES[mode]
+        else:
+            val = int(mode)
+        # The format change only takes effect on a fresh acquisition, so bounce
+        # the stream if it is running.
+        was_streaming = self._streaming
+        if was_streaming:
+            self.stop_stream()
+        self._gvcp.write_reg(reg.REG_IR_FORMAT, val)
+        if was_streaming:
+            self.start_stream()
+
+    def frame_to_celsius(self, frame: np.ndarray) -> np.ndarray:
+        """Convert a frame to °C using whatever the current IR format is.
+
+        In a TemperatureLinear mode the camera already computed temperature, so
+        this is the trivial ``count * kelvin_per_count - 273.15`` (the same
+        one-liner pyTelops uses). In Radiometric mode it falls back to the
+        calibration polynomial via :meth:`counts_to_temperature`.
+
+        Dead pixels read 0 in temperature mode, which maps to -273.15 °C; use
+        :attr:`correct_bad_pixels` / :meth:`detect_bad_pixels` to interpolate
+        them out first if that matters for your display.
+        """
+        self._require_connected()
+        fmt = self._gvcp.read_reg(reg.REG_IR_FORMAT)
+        scale = reg.IR_FORMAT_KELVIN_PER_COUNT.get(fmt)
+        if scale is not None:
+            return frame.astype(np.float64) * scale - 273.15
+        return self.counts_to_temperature(frame)
+
+    @property
+    def pixel_format(self) -> str:
+        """Transport pixel format, e.g. ``"Mono16"`` or ``"Mono14"``.
+
+        The A6751sc has a 14-bit ADC. In ``"Mono16"`` the 14-bit value is
+        MSB-aligned (padded up 2 bits, so a full-scale pixel reads ~65500 and
+        the native count is ``value / 4``). In ``"Mono14"`` the stream is the
+        14-bit value directly (0-16383, no shift). :meth:`counts_to_temperature`
+        adapts automatically, so either format converts correctly.
+        """
+        self._require_connected()
+        return self.read_enum("PixelFormat")
+
+    @pixel_format.setter
+    def pixel_format(self, fmt: str) -> None:
+        self._require_connected()
+        # A format change only takes effect on a fresh acquisition, so bounce
+        # the stream if it is running.
+        was_streaming = self._streaming
+        if was_streaming:
+            self.stop_stream()
+        self.write_enum("PixelFormat", fmt)
+        if was_streaming:
+            self.start_stream()
+
+    def _count_divisor(self, frame: "np.ndarray | None" = None) -> float:
+        """Divisor mapping a raw transport pixel to the native 14-bit ADC count.
+
+        ``Mono16`` MSB-aligns the 14-bit value (<<2 -> divide by 4); ``Mono14``
+        is the value directly (divide by 1). Defaults to 4 (Mono16).
+
+        **The data wins over the register.** The camera will accept a write of
+        ``PixelFormat = Mono14`` while still streaming Mono16, and trusting the
+        register alone then divides by 1 instead of 4 -- inflating counts 4x and
+        pinning every pixel at the block's tmax. A true 14-bit stream cannot
+        exceed 16383, so any frame above that is Mono16 no matter what the
+        register claims. Pass *frame* to enable that check.
+        """
+        if frame is not None and getattr(frame, "size", 0) and int(np.max(frame)) > 16383:
+            return 4.0
+        try:
+            fmt = self.read_enum("PixelFormat")
+        except Exception:
+            return 4.0
+        if "14" in fmt:
+            return 1.0
+        return 4.0
+
+    def to_adc_counts(self, frame: np.ndarray) -> np.ndarray:
+        """Return *frame* as native 14-bit ADC counts (float).
+
+        The wire frame is a 16-bit transport word: on this camera the 14-bit ADC
+        value is left-justified (value << 2), so raw numbers run up to ~65532
+        even though the sensor is 14-bit (max 16383). **The calibration is
+        defined in ADC counts** -- ``counts_min``/``counts_max`` from
+        :meth:`get_calibration` are in this domain -- so this is the number that
+        gets converted to temperature, not the wire value.
+
+        The division is done in floating point, so the low bits (which carry
+        sub-count precision from the camera's on-board processing, not padding)
+        are preserved as a fraction rather than truncated.
+
+        Example::
+
+            f = cam.grab()
+            print(f.max())                      # e.g. 65305  (wire, 16-bit)
+            print(cam.to_adc_counts(f).max())   # e.g. 16326.25  (ADC, 14-bit)
+        """
+        return frame.astype(np.float64) / self._count_divisor(frame)
+
+    def check_scene_fit(self, frame: np.ndarray | None = None) -> dict:
+        """Report how well the loaded calibration block covers the scene.
+
+        A calibration is only valid between its own ``counts_min``/``counts_max``;
+        pixels outside are clamped to ``tmin``/``tmax`` and are not real
+        measurements. If a lot of the scene falls outside, the loaded block is
+        the wrong temperature range -- this reports that and names the block
+        that would fit better.
+
+        Args:
+            frame: Frame to assess; grabbed automatically if omitted.
+
+        Returns:
+            dict with ``block``, ``tmin``/``tmax``, ``below_pct``/``above_pct``
+            (percent of pixels under/over the block's count range),
+            ``in_range_pct``, and ``suggestion`` (a better block index, or None).
+        """
+        self._require_connected()
+        if frame is None:
+            frame = self.grab()
+        cal = self.get_calibration()
+        adc = self.to_adc_counts(frame) - self.count_offset
+        below = float((adc < cal["counts_min"]).mean() * 100.0)
+        above = float((adc > cal["counts_max"]).mean() * 100.0)
+
+        suggestion = None
+        if below + above > 5.0:
+            # Pick the block whose count range covers the most of this scene.
+            best, best_cover = None, -1.0
+            for b in self.get_calibration_blocks():
+                try:
+                    c = self.get_calibration(block=b["index"])
+                except Exception:
+                    continue
+                cover = float(((adc >= c["counts_min"]) & (adc <= c["counts_max"])).mean() * 100.0)
+                if cover > best_cover:
+                    best, best_cover = b["index"], cover
+            if best is not None and best != cal["block"] and best_cover > (100.0 - below - above):
+                suggestion = best
+
+        return {
+            "block": cal["block"],
+            "tmin": cal["tmin"],
+            "tmax": cal["tmax"],
+            "below_pct": below,
+            "above_pct": above,
+            "in_range_pct": 100.0 - below - above,
+            "suggestion": suggestion,
+        }
 
     @property
     def exposure_ms(self) -> float:
@@ -913,6 +1175,7 @@ class Camera:
         index: int | None = None,
         preset: int | None = None,
         timeout: float = 10.0,
+        nuc: bool = True,
     ) -> dict:
         """Load a factory calibration into a preset (changes the live stream).
 
@@ -931,11 +1194,13 @@ class Camera:
         loading "25mm, Empty, -20C - 55C" moved the integration time from
         0.1 ms to 2.354 ms.
 
-        Note: loading also brings in whatever NUC correction is stored with the
-        calibration, which may be stale for the current detector state. If the
-        image shows heavy fixed-pattern noise afterwards, run
-        :meth:`perform_nuc` to compute a fresh correction at the new
-        integration time.
+        Because the integration time changes, the detector's dark level shifts
+        and the stored per-pixel offset no longer matches -- leaving every pixel
+        with a constant count error, and hence a wrong, block-dependent
+        temperature. A :meth:`nuc` (offset update against the internal flag)
+        re-levels it, so this method runs one by default once the load has taken
+        effect. That is what the vendor software does on range select, and
+        skipping it is why switching blocks used to produce nonsense readings.
 
         Args:
             tag: Exact calibration tag to load (e.g. ``"25mm, Empty, -20C - 55C"``);
@@ -945,10 +1210,16 @@ class Camera:
                 load. Mutually exclusive with *tag*.
             preset: Preset to load into. Defaults to the active preset.
             timeout: Seconds to wait for the loaded tag to take effect.
+            nuc: Run :meth:`nuc` after loading. Leave this on unless you have a
+                reason not to -- temperatures are not trustworthy until the
+                offset matches the new integration time. The flag is in the
+                field of view for a few seconds, so discard frames captured
+                during the call.
 
         Returns:
-            dict with ``preset``, ``tag`` (the tag now loaded), and
-            ``exposure_ms`` (the integration time the load set).
+            dict with ``preset``, ``tag`` (the tag now loaded),
+            ``exposure_ms`` (the integration time the load set), and ``nuc``
+            (the :meth:`nuc` result, or ``None`` if it was skipped or failed).
 
         Raises:
             CameraError: if neither/both of *tag*/*index* are given, if the
@@ -1008,17 +1279,212 @@ class Camera:
                 f"Calibration load did not take effect within {timeout}s "
                 f"(requested {tag!r}, loaded tag is {loaded!r})."
             )
-        return {"preset": preset, "tag": loaded, "exposure_ms": self.exposure_ms}
+        # Record the integration time this calibration set, so
+        # counts_to_temperature() can detect a later desync (see the warning
+        # there -- counts scale directly with integration time).
+        exposure = self.exposure_ms
+        self._cal_integration_ms = exposure
+
+        # Re-level the offset to the integration time the load just set. A
+        # failure here leaves a perfectly valid calibration loaded -- it just
+        # isn't offset-corrected yet -- so report it and let the caller decide
+        # rather than discarding a successful load.
+        nuc_result = None
+        if nuc:
+            try:
+                nuc_result = self.nuc()
+            except (CameraError, GVCPError) as exc:
+                logger.warning(
+                    "Calibration %r loaded, but the follow-up NUC failed: %s. "
+                    "Temperatures may be offset until you call cam.nuc().",
+                    loaded,
+                    exc,
+                )
+        return {
+            "preset": preset,
+            "tag": loaded,
+            "exposure_ms": exposure,
+            "nuc": nuc_result,
+        }
 
     def set_calibration_block(self, index: int) -> None:
         """Load the factory calibration at browse *index* into the active preset.
 
         Thin wrapper over :meth:`load_calibration` (``index=`` form). Note this
         genuinely loads the calibration -- which also changes the preset's
-        integration time -- unlike merely moving the browse cursor. See
-        :meth:`load_calibration` for the full contract and the NUC caveat.
+        integration time, and so runs a :meth:`nuc` afterwards -- unlike merely
+        moving the browse cursor. See :meth:`load_calibration` for the full
+        contract.
         """
         self.load_calibration(index=index)
+
+    def nuc(self, timeout: float = 30.0, settle: float = 0.5) -> dict:
+        """Run a non-uniformity correction (offset update) using the internal flag.
+
+        This is the operation the vendor software performs when you select a
+        temperature range: the flag swings into the field of view, the camera
+        re-levels every pixel's offset against it, the flag retracts, and the
+        image is correct a few seconds later. It is an **offset update layered
+        on top of the factory calibration** -- the factory gain terms, which
+        were fit against real blackbody sources, are left untouched.
+
+        Run this after :meth:`load_calibration`. Loading a calibration changes
+        the preset's integration time, which shifts the detector's dark level;
+        until the offset is re-levelled to match, every pixel carries a
+        constant count error and the converted temperatures are wrong by a
+        block-dependent amount. :meth:`load_calibration` calls this for you by
+        default (pass ``nuc=False`` to skip it).
+
+        Also worth running whenever the image drifts -- the camera body warming
+        up after power-on is the usual cause. See :meth:`configure_auto_nuc`
+        to have the camera do this on its own schedule.
+
+        .. note::
+
+            pyflir intentionally does not expose the camera's other, lower-level
+            correction procedure (``CorrectionType`` / ``CorrectionStart`` /
+            ``CorrectionAccept``). That one *recomputes and overwrites* the
+            stored gain coefficients, and running its one-point mode against the
+            flag -- a single near-ambient source -- destroys the factory gain
+            terms and visibly corrupts the image. It is a factory procedure
+            needing real blackbody sources, not a field operation. See the
+            comment above ``REG_CORRECTION_AUTO_ENABLED`` in
+            :mod:`pyflir.registers`.
+
+        The stream does not need to be stopped; frames captured while the flag
+        is in the field of view show the flag, not the scene, so discard
+        anything captured during the call.
+
+        Args:
+            timeout: Seconds to wait for the update to finish. The flag motion
+                plus averaging typically takes ~5 s.
+            settle: Seconds to wait after the camera reports completion, before
+                returning, to let the pipeline flush flag frames.
+
+        Returns:
+            dict with ``duration_s`` (seconds the update took) and
+            ``flag_state`` (the flag's position afterwards, normally
+            ``"Stowed"``).
+
+        Raises:
+            CameraError: if this camera has no NUC flag, or the update does not
+                finish within *timeout*.
+        """
+        self._require_connected()
+
+        # A unit with no flag has no internal uniform source, so this whole
+        # operation is impossible -- fail clearly rather than time out.
+        try:
+            if not self._gvcp.read_reg(reg.REG_FLAG_PRESENT):
+                raise CameraError(
+                    "This camera reports no NUC flag (FlagPresent=0), so an "
+                    "internal-source correction is not possible. Cover the lens "
+                    "with a uniform surface and use the vendor software's "
+                    "external-source correction instead."
+                )
+        except GVCPError as exc:
+            logger.debug("Could not read FlagPresent (%s); attempting NUC anyway.", exc)
+
+        started = time.monotonic()
+        self._gvcp.write_reg(reg.REG_CORRECTION_AUTO_PERFORM, 1)
+
+        # The in-progress flag does not necessarily latch before the first
+        # read, so treat "never saw it go high" as success rather than
+        # hanging: poll until it reads 0 *after* having read 1, or until the
+        # camera has clearly had time to start and is still idle.
+        deadline = started + timeout
+        seen_busy = False
+        while time.monotonic() < deadline:
+            try:
+                busy = bool(self._gvcp.read_reg(reg.REG_CORRECTION_AUTO_IN_PROGRESS))
+            except GVCPError:
+                # The camera is busy reconfiguring and may briefly stop
+                # answering; that itself means the update is running.
+                busy, seen_busy = True, True
+            if busy:
+                seen_busy = True
+            elif seen_busy or time.monotonic() - started > NUC_START_GRACE_S:
+                break
+            time.sleep(0.1)
+        else:
+            raise CameraError(
+                f"NUC did not complete within {timeout}s "
+                f"(CorrectionAutoInProgress still set)."
+            )
+
+        duration = time.monotonic() - started
+        if settle > 0:
+            time.sleep(settle)
+
+        try:
+            flag_state = reg.FLAG_STATE_NAMES.get(
+                self._gvcp.read_reg(reg.REG_FLAG_STATE), "unknown"
+            )
+        except GVCPError:
+            flag_state = "unknown"
+
+        logger.info("NUC complete in %.1fs (flag %s).", duration, flag_state)
+        return {"duration_s": duration, "flag_state": flag_state}
+
+    def configure_auto_nuc(
+        self,
+        enabled: bool = True,
+        delta_temp: float | None = None,
+        delta_time_min: int | None = None,
+    ) -> dict:
+        """Let the camera re-level its own offset on a drift/time trigger.
+
+        With this on, the camera runs the same offset update as :meth:`nuc`
+        by itself whenever a trigger fires, so temperatures stay accurate over
+        a long session without the host doing anything. This is how the vendor
+        software keeps the image stable; the cost is an occasional few seconds
+        of flag frames appearing in the stream at unpredictable moments, which
+        is why it is opt-in here rather than on by default.
+
+        Args:
+            enabled: Whether the camera should self-correct.
+            delta_temp: Front-panel temperature drift in °C that triggers an
+                update. ``None`` leaves the camera's current setting (and its
+                enable flag) alone; a value enables the trigger.
+            delta_time_min: Minutes between updates. ``None`` leaves the
+                camera's current setting alone; a value enables the trigger.
+
+        Returns:
+            dict of the resulting auto-NUC settings, as read back from the
+            camera -- see :meth:`get_auto_nuc_config`.
+        """
+        self._require_connected()
+        if delta_temp is not None:
+            self._gvcp.write_float(reg.REG_CORRECTION_AUTO_DELTA_TEMP, float(delta_temp))
+            self._gvcp.write_reg(reg.REG_CORRECTION_AUTO_USE_DELTA_TEMP, 1)
+        if delta_time_min is not None:
+            self._gvcp.write_reg(reg.REG_CORRECTION_AUTO_DELTA_TIME, int(delta_time_min))
+            self._gvcp.write_reg(reg.REG_CORRECTION_AUTO_USE_DELTA_TIME, 1)
+        self._gvcp.write_reg(reg.REG_CORRECTION_AUTO_ENABLED, 1 if enabled else 0)
+        return self.get_auto_nuc_config()
+
+    def get_auto_nuc_config(self) -> dict:
+        """Read the camera's automatic-NUC settings.
+
+        Returns:
+            dict with ``enabled``, ``use_delta_temp``, ``delta_temp`` (°C),
+            ``use_delta_time``, ``delta_time_min``, and ``in_progress``.
+        """
+        self._require_connected()
+        return {
+            "enabled": bool(self._gvcp.read_reg(reg.REG_CORRECTION_AUTO_ENABLED)),
+            "use_delta_temp": bool(
+                self._gvcp.read_reg(reg.REG_CORRECTION_AUTO_USE_DELTA_TEMP)
+            ),
+            "delta_temp": self._gvcp.read_float(reg.REG_CORRECTION_AUTO_DELTA_TEMP),
+            "use_delta_time": bool(
+                self._gvcp.read_reg(reg.REG_CORRECTION_AUTO_USE_DELTA_TIME)
+            ),
+            "delta_time_min": self._gvcp.read_reg(reg.REG_CORRECTION_AUTO_DELTA_TIME),
+            "in_progress": bool(
+                self._gvcp.read_reg(reg.REG_CORRECTION_AUTO_IN_PROGRESS)
+            ),
+        }
 
     def get_calibration(self, block: int | None = None) -> dict:
         """Read calibration data for a calibration block.
@@ -1078,6 +1544,15 @@ class Camera:
                 "counts_background": self.read_float("CalibrationQueryBackgroundValueReg"),
                 "temp_order": t_order,
                 "temp_coeffs": t_coeffs,
+                # R/B/F: the classic FLIR Planck-approximation radiance->temp
+                # coefficients, an alternative to the temp polynomial above
+                # (apply_calibration(method="rbf")). Min/max radiance bound the
+                # valid domain.
+                "r": self.read_float("CalibrationQueryRReg"),
+                "b": self.read_float("CalibrationQueryBReg"),
+                "f": self.read_float("CalibrationQueryFReg"),
+                "radiance_min": self.read_float("CalibrationQueryMinRadianceReg"),
+                "radiance_max": self.read_float("CalibrationQueryMaxRadianceReg"),
             }
         finally:
             if target is not None:
@@ -1091,6 +1566,8 @@ class Camera:
         atm_temp_c: float | None = None,
         tau: float = 1.0,
         return_status: bool = False,
+        method: str = "rbf",
+        clip: bool = True,
     ) -> "np.ndarray":
         """Convert a raw uint16 frame to temperature in degrees Celsius.
 
@@ -1135,10 +1612,98 @@ class Camera:
                 refl_temp_c = refl_temp_c if refl_temp_c is not None else 23.0
                 atm_temp_c = atm_temp_c if atm_temp_c is not None else 23.0
 
+        # A calibration is fit at one integration time and the counts scale
+        # directly with it, so a mismatch silently biases every temperature.
+        if self._cal_integration_ms:
+            try:
+                now_ms = self.exposure_ms
+                if abs(now_ms - self._cal_integration_ms) > 0.01 * self._cal_integration_ms:
+                    warnings.warn(
+                        f"Integration time ({now_ms:.3f} ms) no longer matches the loaded "
+                        f"calibration's ({self._cal_integration_ms:.3f} ms). Counts scale "
+                        f"with integration time, so temperatures will be wrong by roughly "
+                        f"{now_ms / self._cal_integration_ms:.2f}x in signal. Re-run "
+                        f"load_calibration() (it resets the integration time).",
+                        stacklevel=2,
+                    )
+            except Exception:
+                pass
+
         cal = self.get_calibration()
         return apply_calibration(
-            counts, cal, emissivity, refl_temp_c, atm_temp_c, tau, return_status=return_status
+            counts,
+            cal,
+            emissivity,
+            refl_temp_c,
+            atm_temp_c,
+            tau,
+            return_status=return_status,
+            count_offset=self.count_offset,
+            count_divisor=self._count_divisor(counts),
+            method=method,
+            clip=clip,
         )
+
+    def set_offset_reference(
+        self,
+        known_temp_c: float,
+        frame: "np.ndarray | None" = None,
+        region: "tuple[int, int, int, int] | None" = None,
+    ) -> float:
+        """Calibrate the host-side count offset against a known-temperature target.
+
+        .. warning::
+
+            Try :meth:`nuc` first. If a uniform surface reads too hot or too
+            cold by a roughly constant amount, the usual cause is a detector
+            offset that no longer matches the integration time, and the correct
+            fix is an offset update on the camera -- not a host-side fudge
+            factor. This method exists for a *residual* bias that survives a
+            NUC, and it is only as good as your knowledge of the target's true
+            temperature. Skin, in particular, is not a reference: its apparent
+            temperature depends on emissivity, blood flow, and the ambient
+            reflection you are also measuring.
+
+        Point the camera at a target whose temperature you genuinely know, fill
+        the frame (or pass *region*), and call this: it measures the shift and
+        stores it in :attr:`count_offset`, which
+        :meth:`counts_to_temperature`/:meth:`frame_to_celsius` then subtract.
+        Requires ``ir_format = "Radiometric"`` (raw counts).
+
+        The target should fill the *region* and be uniform, and the image
+        should already be spatially clean, since a single scalar offset cannot
+        fix spatial non-uniformity.
+
+        Args:
+            known_temp_c: The true temperature of the target, in °C.
+            frame: A raw frame to measure; grabbed automatically if omitted.
+            region: ``(row0, row1, col0, col1)`` sub-window to average over.
+                Defaults to a centred quarter-size box.
+
+        Returns:
+            The stored :attr:`count_offset` (14-bit counts).
+        """
+        self._require_connected()
+        cal = self.get_calibration()
+        if frame is None:
+            frame = self.grab()
+        x = frame.astype(np.float64) / self._count_divisor(frame)  # native 14-bit
+        if region is None:
+            h, w = x.shape
+            region = (h // 2 - h // 4, h // 2 + h // 4, w // 2 - w // 4, w // 2 + w // 4)
+        r0, r1, c0, c1 = region
+        measured = float(np.median(x[r0:r1, c0:c1]))
+
+        # Count (14-bit) that maps to known_temp_c under the calibration.
+        c_hi = np.asarray(cal["counts_coeffs"], dtype=np.float64)[::-1]
+        t_hi = np.asarray(cal["temp_coeffs"], dtype=np.float64)[::-1]
+        bg = float(cal.get("counts_background", 0.0))
+        grid = np.linspace(float(cal["counts_min"]), float(cal["counts_max"]), 40001)
+        temps = np.polyval(t_hi, np.polyval(c_hi, grid) - bg)
+        target = float(grid[int(np.argmin(np.abs(temps - known_temp_c)))])
+
+        self.count_offset = measured - target
+        return self.count_offset
 
     # ------------------------------------------------------------------
     # Radiometry parameters
@@ -1295,294 +1860,6 @@ class Camera:
             offset_y,
             fps_str,
         )
-
-    # ------------------------------------------------------------------
-    # NUC (Non-Uniformity Correction)
-    # ------------------------------------------------------------------
-
-    def get_nuc_status(self, preset: int = 0) -> dict:
-        """Return the NUC correction currently loaded for *preset*.
-
-        Args:
-            preset: Preset index to query (0–3). Default 0.
-
-        Returns:
-            dict with key ``name`` (str, the currently loaded correction's
-            name; empty string if none is loaded).
-        """
-        self._require_connected()
-        if preset not in reg.REG_CORRECTION_NAME:
-            raise CameraError(f"Invalid preset {preset}. Must be 0–3.")
-        return {"name": self._read_string(reg.REG_CORRECTION_NAME[preset])}
-
-    def has_flag(self) -> bool:
-        """Return whether this camera has a physical NUC flag (shutter)."""
-        self._require_connected()
-        return bool(self._gvcp.read_reg(reg.REG_FLAG_PRESENT))
-
-    def get_flag_state(self) -> str:
-        """Return the NUC flag's current position: ``"Stowed"`` or ``"InFOV"``.
-
-        Raises:
-            CameraError: If this camera has no NUC flag (see :meth:`has_flag`).
-        """
-        self._require_connected()
-        if not self.has_flag():
-            raise CameraError("This camera has no NUC flag (has_flag() is False).")
-        raw = self._gvcp.read_reg(reg.REG_FLAG_STATE)
-        return reg.FLAG_STATE_NAMES.get(raw, f"<unknown:{raw}>")
-
-    def flag_move_in_fov(self) -> None:
-        """Move the internal NUC flag into the field of view.
-
-        Only available on cameras equipped with a physical shutter
-        (e.g. FLIR A6751sc). Call before capturing a flat-field reference.
-
-        This only sends the move command; the flag is a physical mechanism
-        and takes time to actually reach position. Poll
-        :meth:`get_flag_state` for ``"InFOV"`` before capturing a flat-field
-        frame rather than assuming the move completed instantly.
-        """
-        self._require_connected()
-        self._gvcp.write_reg(reg.REG_FLAG_IN_FOV, 1)
-        logger.info("NUC flag commanded into FOV.")
-
-    def flag_move_stowed(self) -> None:
-        """Move the internal NUC flag out of the field of view.
-
-        See :meth:`flag_move_in_fov` for why this doesn't wait for the
-        physical move to complete.
-        """
-        self._require_connected()
-        self._gvcp.write_reg(reg.REG_FLAG_STOWED, 1)
-        logger.info("NUC flag commanded to stowed position.")
-
-    # ------------------------------------------------------------------
-    # NUC: performing a new correction. GenICam group "CorrectionPerform":
-    # a state machine, see registers.py for the full status/result enum
-    # tables.
-    # ------------------------------------------------------------------
-
-    def get_correction_status(self) -> dict:
-        """Return the live status of an in-progress (or just-finished) NUC correction.
-
-        Returns:
-            dict with keys ``status`` (str, e.g. ``"Ready"``,
-            ``"CollectingFirstSource"``, ``"WaitingForFirstSourceExternal"``
-            -- see :data:`pyflir.registers.CORRECTION_STATUS_NAMES` for the
-            full set) and ``text`` (str, human-readable detail from the
-            camera, descriptive enough to know what to do next).
-        """
-        self._require_connected()
-        raw = self._gvcp.read_reg(reg.REG_CORRECTION_STATUS)
-        status = reg.CORRECTION_STATUS_NAMES.get(raw, f"<unknown:{raw}>")
-        return {"status": status, "text": self._read_string(reg.REG_CORRECTION_STATUS_TEXT)}
-
-    def get_correction_result(self) -> dict:
-        """Return the outcome of the most recently completed NUC correction.
-
-        Returns:
-            dict with keys ``result`` (str: ``"Okay"``, ``"Abort"``,
-            ``"AbortInvalidParam"``, or ``"AbortFlagCoolerRunaway"``) and
-            ``text`` (str, human-readable detail from the camera).
-        """
-        self._require_connected()
-        raw = self._gvcp.read_reg(reg.REG_CORRECTION_RESULT)
-        result = reg.CORRECTION_RESULT_NAMES.get(raw, f"<unknown:{raw}>")
-        return {"result": result, "text": self._read_string(reg.REG_CORRECTION_RESULT_TEXT)}
-
-    def correction_start(
-        self,
-        preset: int = 0,
-        correction_type: str = "OnePoint",
-        source: str = "Internal",
-    ) -> None:
-        """Start a new NUC correction process (low-level).
-
-        Prefer :meth:`perform_nuc` for the common case (internal flag,
-        fully automatic, blocks until done). Use this directly for a
-        "TwoPoint" or ``source="External"`` workflow, which need a person
-        to present a uniform target and call :meth:`correction_continue`
-        partway through -- :meth:`perform_nuc` doesn't support those.
-
-        After calling this, poll :meth:`get_correction_status` and act on
-        the status:
-
-        - ``"WaitingForFirst/SecondSourceExternal"``: present a uniform
-          target in the field of view, then call :meth:`correction_continue`.
-        - ``"WaitingForFirst/SecondSourceInternal"``: no action needed, the
-          camera is bringing its own flag to temperature; keep polling.
-        - ``"Ready"``: the process is complete. Check
-          :meth:`get_correction_result`, then call :meth:`correction_accept`
-          or :meth:`correction_discard`.
-
-        Args:
-            preset: Preset index to correct (0–3). Default 0.
-            correction_type: ``"OnePoint"`` (offset only -- the standard
-                routine flat-field NUC), ``"TwoPoint"`` (gain and offset,
-                needs two distinct uniform sources), or ``"UpdateOffset"``
-                (offset only, gain unchanged, faster than a full OnePoint).
-            source: ``"Internal"`` (the camera's own NUC flag, fully
-                automatic) or ``"External"`` (a uniform target you present
-                yourself).
-
-        Raises:
-            CameraError: If *preset*, *correction_type*, or *source* is invalid.
-        """
-        self._require_connected()
-        if preset not in reg.REG_CORRECTION_PS:
-            raise CameraError(f"Invalid preset {preset}. Must be 0–3.")
-        type_values = {v: k for k, v in reg.CORRECTION_TYPE_NAMES.items()}
-        if correction_type not in type_values:
-            raise CameraError(
-                f"Invalid correction_type {correction_type!r}. Must be one of {list(type_values)}."
-            )
-        source_values = {v: k for k, v in reg.CORRECTION_SOURCE_NAMES.items()}
-        if source not in source_values:
-            raise CameraError(f"Invalid source {source!r}. Must be one of {list(source_values)}.")
-
-        self._gvcp.write_reg(reg.REG_CORRECTION_TYPE, type_values[correction_type])
-        self._gvcp.write_reg(reg.REG_CORRECTION_SOURCE, source_values[source])
-        for p, addr in reg.REG_CORRECTION_PS.items():
-            self._gvcp.write_reg(addr, 1 if p == preset else 0)
-        self._gvcp.write_reg(reg.REG_CORRECTION_START, 1)
-        logger.info(
-            "NUC correction started for preset %d (%s, %s source).", preset, correction_type, source
-        )
-
-    def correction_continue(self) -> None:
-        """Advance past a "WaitingFor...SourceExternal" status.
-
-        Call after presenting a uniform target in the field of view.
-        """
-        self._require_connected()
-        self._gvcp.write_reg(reg.REG_CORRECTION_CONTINUE, 1)
-
-    def correction_accept(self) -> None:
-        """Keep the new correction computed by the current/last process."""
-        self._require_connected()
-        self._gvcp.write_reg(reg.REG_CORRECTION_ACCEPT, 1)
-
-    def correction_discard(self) -> None:
-        """Discard the new correction and revert to the previous one."""
-        self._require_connected()
-        self._gvcp.write_reg(reg.REG_CORRECTION_DISCARD, 1)
-
-    def correction_abort(self) -> None:
-        """Cancel an in-progress correction process.
-
-        Per the camera's own GenICam description, a started process must be
-        accepted, discarded, or aborted to properly end it.
-        """
-        self._require_connected()
-        self._gvcp.write_reg(reg.REG_CORRECTION_ABORT, 1)
-
-    def perform_nuc(
-        self,
-        preset: int = 0,
-        correction_type: str = "OnePoint",
-        timeout: float = 60.0,
-        poll_interval: float = 0.5,
-        auto_accept: bool = True,
-    ) -> dict:
-        """Perform a new NUC (Non-Uniformity Correction) now.
-
-        This is the "just run it and it does NUC" command: it computes a
-        fresh correction and blocks until done, using the camera's own
-        internal NUC flag as the uniform reference -- fully automatic, the
-        camera brings the flag to temperature and captures the reference
-        itself, no user action needed.
-
-        For an external-blackbody or "TwoPoint" workflow, which need a
-        person to present a target and call :meth:`correction_continue`
-        partway through, use :meth:`correction_start` directly instead.
-
-        Args:
-            preset: Preset index to correct (0–3). Default 0.
-            correction_type: ``"OnePoint"`` (offset only -- the standard
-                routine flat-field NUC, default) or ``"UpdateOffset"``
-                (offset only, faster, meant for use between full
-                corrections). Not ``"TwoPoint"``: that needs two distinct
-                uniform sources, which a single internal flag at one
-                temperature can't provide -- use :meth:`correction_start`
-                for it.
-            timeout: Seconds to wait for the process to reach ``"Ready"``
-                before aborting and raising. Generous by default since the
-                flag may take a while to reach its target temperature.
-            poll_interval: Seconds between status polls.
-            auto_accept: If True (default), call :meth:`correction_accept`
-                automatically once the result is ``"Okay"``. If False,
-                leave the correction pending for you to accept or discard.
-
-        Returns:
-            dict from :meth:`get_correction_result` (keys ``result``, ``text``).
-
-        Raises:
-            CameraError: If the camera has no NUC flag, *preset* or
-                *correction_type* is invalid, the process times out, the
-                camera unexpectedly asks for an external source, or the
-                result is not ``"Okay"``.
-
-        Warning:
-            Not yet verified against a live camera -- implemented from the
-            camera's own GenICam XML (register addresses and the
-            Start/Continue/Accept/Discard/Abort state machine), not tested
-            end to end. Try a short *timeout* first and watch logs before
-            relying on it.
-        """
-        self._require_connected()
-        if not self.has_flag():
-            raise CameraError(
-                "This camera has no NUC flag (has_flag() is False); perform_nuc() "
-                "requires the internal-flag source. Use correction_start(source="
-                "'External', ...) with a uniform target instead."
-            )
-        if correction_type == "TwoPoint":
-            raise CameraError(
-                "TwoPoint correction needs two distinct uniform sources; not "
-                "meaningful with a single internal flag at one temperature. "
-                "Use correction_start() directly for a TwoPoint/External workflow."
-            )
-
-        self.correction_start(preset=preset, correction_type=correction_type, source="Internal")
-
-        deadline = time.monotonic() + timeout
-        external_statuses = {"WaitingForFirstSourceExternal", "WaitingForSecondSourceExternal"}
-        while True:
-            status = self.get_correction_status()
-            if status["status"] == "Ready":
-                break
-            if status["status"] in external_statuses:
-                with contextlib.suppress(Exception):
-                    self.correction_abort()
-                raise CameraError(
-                    f"Camera unexpectedly asked for an external uniform source "
-                    f"({status['status']}) despite requesting the internal flag; "
-                    f"aborted. {status['text']}"
-                )
-            if time.monotonic() >= deadline:
-                with contextlib.suppress(Exception):
-                    self.correction_abort()
-                raise CameraError(
-                    f"NUC correction timed out after {timeout:.0f}s "
-                    f"(last status: {status['status']} - {status['text']})."
-                )
-            time.sleep(poll_interval)
-
-        result = self.get_correction_result()
-        if result["result"] != "Okay":
-            raise CameraError(f"NUC correction failed: {result['result']} - {result['text']}")
-
-        if auto_accept:
-            self.correction_accept()
-            logger.info("NUC correction complete and accepted for preset %d.", preset)
-        else:
-            logger.info(
-                "NUC correction complete for preset %d; call correction_accept() "
-                "or correction_discard() to finish.",
-                preset,
-            )
-        return result
 
     # ------------------------------------------------------------------
     # Diagnostics
@@ -1760,6 +2037,43 @@ class Camera:
             self._gvcp.write_reg(addr + off, word)
 
 
+def replace_bad_pixels(
+    frame: np.ndarray,
+    mask: "np.ndarray | None" = None,
+    sigma: float = 6.0,
+) -> "tuple[np.ndarray, np.ndarray]":
+    """Interpolate over bad pixels by replacing them with a 3x3 neighbour median.
+
+    Works on raw counts (before radiometric conversion). If *mask* is given
+    (e.g. from :meth:`Camera.detect_bad_pixels`), exactly those pixels are
+    replaced. If *mask* is ``None``, bad pixels are auto-detected per frame as
+    those reading <= 0 or deviating from their local median by more than
+    *sigma* robust standard deviations -- convenient for a one-off frame but
+    slower and less stable than a precomputed mask.
+
+    Args:
+        frame: 2-D array of raw counts.
+        mask: Optional boolean array (same shape) of pixels to replace.
+        sigma: Outlier threshold (robust std units) for auto-detection.
+
+    Returns:
+        ``(corrected_frame, mask)`` -- the corrected copy (same dtype) and the
+        boolean mask of replaced pixels.
+    """
+    f = frame.astype(np.float64)
+    h, w = f.shape
+    pad = np.pad(f, 1, mode="edge")
+    neigh = np.stack([pad[i : i + h, j : j + w] for i in range(3) for j in range(3)])
+    med = np.median(neigh, axis=0)
+    if mask is None:
+        resid = f - med
+        mad = float(np.median(np.abs(resid - np.median(resid)))) + 1e-9
+        mask = (f <= 0) | (np.abs(resid) > sigma * 1.4826 * mad)
+    out = frame.copy()
+    out[mask] = med[mask].astype(frame.dtype)
+    return out, mask
+
+
 # ---------------------------------------------------------------------------
 # Standalone radiometric conversion (works offline with a cached cal dict)
 # ---------------------------------------------------------------------------
@@ -1780,6 +2094,10 @@ def apply_calibration(
     atm_temp_c: float = 23.0,
     tau: float = 1.0,
     return_status: bool = False,
+    count_offset: float = 0.0,
+    count_divisor: float = 4.0,
+    method: str = "rbf",
+    clip: bool = True,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """Convert raw uint16 counts to °C using a pre-read calibration dict.
 
@@ -1867,13 +2185,21 @@ def apply_calibration(
     cmin = float(cal["counts_min"])
     cmax = float(cal["counts_max"])
     tmin = float(cal["tmin"])
+    tmax = float(cal["tmax"])
     background = float(cal.get("counts_background", 0.0))
 
-    # The A6751sc has a 14-bit ADC but GigE Vision streams Mono16 with the
-    # value left-justified (uint16 = adc_14bit << 2).  The calibration
-    # endpoints counts_min/counts_max are in native 14-bit space, so divide
-    # raw pixel values by 4 to bring them into the same domain.
-    x = counts.astype(np.float64) / 4.0
+    # The A6751sc has a 14-bit ADC. The calibration endpoints counts_min/max are
+    # in native 14-bit space. In Mono16 the transport left-justifies the value
+    # (uint16 = adc_14bit << 2), so count_divisor=4 brings it back to 14-bit; in
+    # Mono14 the stream is already 14-bit, so count_divisor=1. Camera.
+    # counts_to_temperature() passes the divisor for the active pixel format.
+    x = counts.astype(np.float64) / count_divisor
+
+    # Host-side one-point offset (see Camera.set_offset_reference): the camera's
+    # NUC can leave counts shifted from what the calibration expects; subtract
+    # the measured shift here, in the 14-bit domain, before the polynomial.
+    if count_offset:
+        x = x - count_offset
 
     status = np.full(x.shape, STATUS_OK, dtype=np.uint8)
     status[x < cmin] = STATUS_UNDERFLOW
@@ -1892,35 +2218,71 @@ def apply_calibration(
     # Determine K→C offset by checking the polynomial output at the known
     # block endpoints (tmin/tmax are confirmed Celsius).  If the polynomial
     # outputs Kelvin, the endpoint values will be ~273 higher than tmin/tmax.
-    w_lo = float(np.polyval(c_hi, cmin)) - background
-    t_lo = float(np.polyval(t_hi, w_lo))
-    offs = 273.15 if abs(t_lo - 273.15 - tmin) < abs(t_lo - tmin) else 0.0
+    # radiance -> temperature (°C) and its inverse, for the selected method.
+    rr, bb, ff = float(cal.get("r", 0.0)), float(cal.get("b", 0.0)), float(cal.get("f", 0.0))
+    if method == "rbf" and not (rr and bb):
+        # r/b/f unavailable (e.g. a cached cal dict from before this existed) ->
+        # fall back to the temperature polynomial rather than produce NaNs.
+        method = "polynomial"
+    if method == "rbf":
+        # FLIR's official radiometric formula (confirmed by FLIR KB a_id/3321):
+        #     T_kelvin = B / ln(R / radiance + F)
+        # with inverse  radiance = R / (exp(B / T_kelvin) - F). This is the
+        # authoritative method; the temperature polynomial below is only a fit.
 
-    w_obj = w_total
-    if emissivity != 1.0 or tau != 1.0:
+        def _rad_to_temp_c(w):
+            with np.errstate(divide="ignore", invalid="ignore"):
+                return bb / np.log(rr / w + ff) - 273.15
+
+        def _temp_c_to_rad(temp_c: float) -> float:
+            return rr / (np.exp(bb / (temp_c + 273.15)) - ff)
+    else:
+        # Polynomial. Detect whether it outputs Kelvin or Celsius from the block
+        # endpoints (tmin/tmax are confirmed Celsius): a Kelvin fit reads ~273
+        # higher at cmin.
+        w_lo = float(np.polyval(c_hi, cmin)) - background
+        t_lo = float(np.polyval(t_hi, w_lo))
+        offs = 273.15 if abs(t_lo - 273.15 - tmin) < abs(t_lo - tmin) else 0.0
         w_cmin = float(np.polyval(c_hi, cmin)) - background
         w_cmax = float(np.polyval(c_hi, cmax)) - background
 
-        def _radiance_at(temp_c: float) -> float:
-            """Invert the radiance→temperature polynomial at a known temperature."""
-            target = temp_c + offs
+        def _rad_to_temp_c(w):
+            return np.polyval(t_hi, w) - offs
+
+        def _temp_c_to_rad(temp_c: float) -> float:
             shifted = t_hi.copy()
-            shifted[-1] -= target
+            shifted[-1] -= temp_c + offs
             roots = np.roots(shifted)
             real_roots = roots[np.abs(roots.imag) < 1e-6].real
             lo, hi = sorted((w_cmin, w_cmax))
             if real_roots.size == 0:
-                raise ValueError(f"Could not invert temperature→radiance polynomial for {temp_c}°C")
+                raise ValueError(
+                    f"Could not invert temperature->radiance polynomial for {temp_c} C"
+                )
             in_domain = real_roots[(real_roots >= lo) & (real_roots <= hi)]
             candidates = in_domain if in_domain.size else real_roots
             return float(candidates[np.argmin(np.abs(candidates - (lo + hi) / 2))])
 
-        w_refl = _radiance_at(refl_temp_c)
-        w_atm = _radiance_at(atm_temp_c)
+    w_obj = w_total
+    if emissivity != 1.0 or tau != 1.0:
+        w_refl = _temp_c_to_rad(refl_temp_c)
+        w_atm = _temp_c_to_rad(atm_temp_c)
         w_obj = (w_total - (1 - emissivity) * tau * w_refl - (1 - tau) * w_atm) / (emissivity * tau)
 
-    t = np.polyval(t_hi, w_obj)
-    result = t - offs
+    result = _rad_to_temp_c(w_obj)
+
+    # The calibration is only valid within its own [tmin, tmax] limits (the SDK
+    # carries the same tmin/tmax/rmin/rmax). With clip=True (default) results are
+    # clamped to that range, which also stops object-parameter compensation from
+    # pushing a saturated pixel to a physically impossible value above tmax.
+    #
+    # Clamping makes out-of-range pixels *look* like real measurements at the
+    # endpoints (a scene that over-ranges reads as a solid block of tmax). With
+    # clip=False they become NaN instead, so an unsuitable calibration block is
+    # visible rather than silently faked. Either way they are flagged in `status`.
+    result = (
+        np.clip(result, tmin, tmax) if clip else np.where(status == STATUS_OK, result, np.nan)
+    )
 
     if return_status:
         return result, status

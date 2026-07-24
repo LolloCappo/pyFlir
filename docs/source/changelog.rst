@@ -1,6 +1,117 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+- **Hardened raw-count identification and the calibration/integration-time
+  contract**, the two things that silently corrupt temperatures:
+
+  - ``Camera.to_adc_counts(frame)`` makes the conversion domain explicit. The
+    wire frame is a 16-bit transport word holding a left-justified 14-bit ADC
+    value (so raw numbers reach ~65532 on a 14-bit sensor); the calibration's
+    ``counts_min``/``counts_max`` are in **ADC counts**, and that is what gets
+    converted. The division is done in floating point, so the low bits -- which
+    carry sub-count precision from the camera's on-board processing, *not*
+    padding -- are preserved rather than truncated.
+  - ``_count_divisor()`` now lets the **data override the register**: the camera
+    accepts ``PixelFormat = Mono14`` while still streaming Mono16, and trusting
+    the register then divided by 1 instead of 4, inflating counts 4x and pinning
+    every pixel at ``tmax``. A 14-bit stream cannot exceed 16383, so anything
+    above that is treated as Mono16 regardless of what the register claims.
+  - ``load_calibration()`` records the integration time it set, and
+    ``counts_to_temperature()`` **warns if the two have since diverged** --
+    counts scale directly with integration time, so a mismatch biases every
+    reading (the warning states the approximate factor).
+  - ``Camera.check_scene_fit(frame)`` reports what fraction of the scene falls
+    outside the loaded block's count range and suggests a better block. A
+    calibration is only valid between its own ``counts_min``/``counts_max``;
+    outside it the values are not measurements.
+  - ``apply_calibration``/``counts_to_temperature`` take ``clip`` (default
+    ``True``, unchanged). With ``clip=False`` out-of-range pixels become ``NaN``
+    instead of being pinned to ``tmin``/``tmax``, so an unsuitable calibration
+    block is visible rather than silently rendered as a solid block of endpoint
+    temperatures.
+
+- **Added FLIR's official R/B/F radiance→temperature formula, now the default.**
+  The camera calibration is an "RBF" formula (FLIR KB a_id/3321):
+  ``T_kelvin = B / ln(R / radiance + F)``, using the ``CalibrationQueryR/B/F``
+  coefficients the camera exposes. pyFlir previously used only the temperature
+  *polynomial* (``CalibrationQueryTempCoeff``), which is a fit -- self-consistent
+  at the block endpoints by construction, but potentially wrong in between.
+  ``apply_calibration``/``counts_to_temperature`` now take ``method="rbf"``
+  (default) or ``method="polynomial"``, and ``get_calibration()`` returns
+  ``r``/``b``/``f`` (plus ``radiance_min``/``radiance_max``). RBF falls back to
+  the polynomial if a (e.g. cached) cal dict lacks the coefficients. Note: this
+  camera exposes no separate J0/J1, so the counts→radiance step remains the
+  polynomial (the J0/J1 linear form is its special case).
+
+- Added ``Camera.pixel_format`` (``"Mono16"`` / ``"Mono14"``); the count divisor
+  adapts automatically (Mono16 left-justifies the 14-bit value, ``÷4``; Mono14 is
+  native 14-bit, ``÷1``). Fixed a GenICam-parser bug that dropped enum name↔value
+  maps for split ``Enumeration``/``Reg`` nodes, which had silently broken
+  ``read_enum``/``write_enum`` (returning ``<unknown:N>`` and rejecting valid
+  values) -- this affected ``pixel_format`` and any enum feature.
+
+- **Rebuilt NUC handling on the camera's offset-update path, and made
+  ``load_calibration()`` run one.** This closes the last known source of wrong
+  absolute temperatures.
+
+  The camera exposes two distinct correction paths, and pyFlir previously drove
+  the wrong one. ``CorrectionPerform`` (``CorrectionType`` / ``CorrectionStart``
+  / ``CorrectionAccept``) collects and averages "frames from each uniform
+  temperature source" -- it *recomputes and overwrites the stored gain
+  coefficients*. Running its one-point mode against the internal flag, a single
+  near-ambient source, is not a substitute for a factory calibration fit against
+  real blackbodies: it replaces good gain terms with garbage and visibly
+  corrupts the image (swirl and contour artifacts on object edges). That damage
+  is stored, so it survives power cycles. **pyFlir no longer exposes it**, and a
+  regression test asserts those registers are never written.
+
+  ``CorrectionAuto`` is the routine one -- the camera's XML describes it as
+  "automatic non uniformity correction with the internal flag (offset update)".
+  It re-levels the per-pixel *offset* on top of the factory calibration and
+  leaves the factory gain terms alone. This is what the vendor software runs on
+  range select (flag click, a few seconds, correct image), and it is now
+  ``Camera.nuc()``.
+
+  - ``Camera.nuc()`` triggers an offset update and waits for it to finish.
+  - ``load_calibration()`` calls it by default (``nuc=False`` to skip).
+    **This was the missing step.** Loading a calibration changes the integration
+    time, which shifts the detector's dark level; until the offset is re-levelled
+    the stored one no longer matches and every pixel carries a constant count
+    error. That is why the same scene read ~36 °C on block 0 and ~81 °C on block
+    1, with counts *rising* despite a 2.4x shorter integration -- the signature
+    of a stale offset, not a bad conversion. A failed NUC is reported but does
+    not discard an otherwise successful load.
+  - ``Camera.configure_auto_nuc()`` / ``get_auto_nuc_config()`` let the camera
+    re-level itself on a temperature-drift or elapsed-time trigger, as the
+    vendor software does. Opt-in, since it injects flag frames into the stream
+    at unpredictable moments.
+  - Restored as read-only observability: ``FlagPresent`` / ``FlagState``. pyFlir
+    never parks or moves the flag itself; the camera does that internally.
+
+  Still not exposed (unchanged from the removal): ``load_nuc`` / ``list_nucs`` /
+  ``query_nuc`` / ``load_matching_nuc``, ``get_nuc_status``, ``flag_move_*``.
+
+- Added camera-side temperature output and a host-side offset, the two things
+  that actually matter for correct temperatures:
+
+  - ``Camera.ir_format`` selects what the camera streams -- ``"Radiometric"``
+    (raw counts, converted host-side by the calibration polynomial) or the
+    on-board ``"TemperatureLinear10mK"`` / ``"TemperatureLinear100mK"`` modes.
+    ``Camera.frame_to_celsius(frame)`` converts either (a rescale in temperature
+    mode, the polynomial in raw mode).
+  - ``Camera.set_offset_reference(known_temp_c)`` calibrates a one-point offset
+    against a target of known temperature, to correct a constant shift in the
+    raw counts. Now demoted to a last resort: the supported fix for a counts
+    offset is ``Camera.nuc()``, which corrects it on the camera where it
+    belongs. This remains a host-side workaround for a *residual* bias, it
+    assumes the conversion's shape is right and only the offset is wrong, and it
+    is only as good as your knowledge of the target's true temperature.
+    Absolute radiometric accuracy is still unverified end-to-end -- that needs a
+    known-temperature reference (ice water, or a calibrated blackbody).
+
 Version 0.2.1
 -------------
 

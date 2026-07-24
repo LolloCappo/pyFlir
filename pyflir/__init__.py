@@ -33,6 +33,7 @@ from .camera import (
     CameraError,
     apply_calibration,
     discover,
+    replace_bad_pixels,
 )
 from .connection import ConnectionReport, tune_connection
 from .errors import ConnectionStats
@@ -55,6 +56,7 @@ __all__ = [
     "discover",
     "force_ip",
     "apply_calibration",
+    "replace_bad_pixels",
     "STATUS_OK",
     "STATUS_UNDERFLOW",
     "STATUS_OVERFLOW",

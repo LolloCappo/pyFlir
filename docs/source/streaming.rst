@@ -72,19 +72,20 @@ the ``SensorHeight`` register and comparing it to the frame height. The extra
 rows are stripped from every returned frame; the stripped data is accessible on
 ``cam.last_metadata_rows`` if needed.
 
-NUC and flag
-------------
+One-point offset
+----------------
 
-Non-Uniformity Correction improves image uniformity. ``perform_nuc()`` computes
-a fresh correction and drives the internal flag automatically -- no manual flag
-handling needed:
+pyFlir leaves the camera's on-board NUC as the camera boots it and does not
+drive it. The calibration conversion is exact, but the detector offset can make
+a uniform surface read too hot by a constant. Correct it against a known target:
 
 .. code-block:: python
 
-    cam.perform_nuc()         # compute a fresh correction, blocks until done
+    # aim at a target of known temperature filling the centre, then:
+    off = cam.set_offset_reference(34.0)      # e.g. a hand at ~34 °C
+    temp = cam.frame_to_celsius(cam.grab())   # now reads correctly
 
-The camera must be streaming or in a suitable state for the NUC command to be
-accepted; refer to the camera's hardware manual for timing requirements.
+The offset holds for the session; re-run it if you change block or integration.
 
 Calibration blocks
 ------------------
@@ -105,9 +106,9 @@ time together -- you do not set integration time independently. List and load:
                                     # also sets its integration time
 
 Writing :attr:`Camera.exposure_ms` yourself desyncs the raw counts from the
-loaded calibration (temperatures read wrong) and emits a warning. After loading,
-if the image shows fixed-pattern noise, run :meth:`Camera.perform_nuc` to compute
-a fresh correction at the new integration time.
+loaded calibration (temperatures read wrong) and emits a warning. Loading a
+calibration also shifts the detector offset; correct it with
+:meth:`Camera.set_offset_reference` (see above) if a uniform surface reads hot.
 
 Radiometric object parameters
 ------------------------------

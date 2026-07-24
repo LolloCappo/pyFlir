@@ -253,3 +253,74 @@ class TestApplyCalibrationObjectParameters:
             raw, cal, emissivity=emissivity, refl_temp_c=refl_temp_c, atm_temp_c=atm_temp_c, tau=tau
         )
         assert abs(float(result[0, 0]) - expected_t) < 1e-6
+
+
+class TestApplyCalibrationRBF:
+    """R/B/F Planck conversion (FLIR's official radiance->temperature formula)."""
+
+    def _rbf_cal(self, r, b, f):
+        # counts->radiance is identity in 14-bit (coeff1=1) so radiance == count,
+        # letting us hand-check T_kelvin = B / ln(R/count + F).
+        return {
+            "tmin": -50.0,
+            "tmax": 500.0,
+            "counts_min": 1.0,
+            "counts_max": 16000.0,
+            "counts_background": 0.0,
+            "counts_coeffs": [0.0, 1.0],
+            "temp_coeffs": [0.0, 1.0],
+            "r": r,
+            "b": b,
+            "f": f,
+        }
+
+    def test_rbf_matches_flir_formula(self):
+        # Chosen so T lands in [tmin, tmax] (not clamped): ~99.9 C.
+        r, b, f = 213300.0, 1400.0, 0.0
+        cal = self._rbf_cal(r, b, f)
+        count = 5000
+        expected_c = b / np.log(r / count + f) - 273.15  # FLIR: T_K = B/ln(R/rad + F)
+        assert -50.0 < expected_c < 500.0  # guard: in range, so no clamp
+        raw = np.full((2, 2), count, dtype=np.uint16)
+        out = apply_calibration(raw, cal, count_divisor=1.0, method="rbf")
+        assert abs(float(out.mean()) - expected_c) < 1e-6
+
+    def test_rbf_differs_from_polynomial(self):
+        cal = self._rbf_cal(213300.0, 1400.0, 0.0)
+        raw = np.full((2, 2), 5000, dtype=np.uint16)
+        t_rbf = float(apply_calibration(raw, cal, count_divisor=1.0, method="rbf").mean())
+        t_poly = float(apply_calibration(raw, cal, count_divisor=1.0, method="polynomial").mean())
+        assert not np.isclose(t_rbf, t_poly)
+
+    def test_rbf_falls_back_to_polynomial_without_coeffs(self):
+        # A cal dict lacking r/b/f (e.g. cached) must not blow up under method=rbf.
+        cal = _make_cal()  # no r/b/f
+        raw = np.array([[8192 * 4]], dtype=np.uint16)
+        out_rbf = apply_calibration(raw, cal, method="rbf")
+        out_poly = apply_calibration(raw, cal, method="polynomial")
+        assert np.isclose(float(out_rbf[0, 0]), float(out_poly[0, 0]))
+
+
+class TestApplyCalibrationClipOption:
+    """clip=False exposes out-of-range pixels as NaN instead of faking endpoints."""
+
+    def test_clip_true_pins_out_of_range_to_endpoints(self):
+        cal = _make_cal(tmin=-20.0, tmax=55.0, counts_min=2000.0, counts_max=12000.0)
+        over = np.full((2, 2), 15000 * 4, dtype=np.uint16)  # above counts_max
+        out = apply_calibration(over, cal, clip=True)
+        assert np.allclose(out, 55.0)
+
+    def test_clip_false_marks_out_of_range_nan(self):
+        cal = _make_cal(tmin=-20.0, tmax=55.0, counts_min=2000.0, counts_max=12000.0)
+        over = np.full((2, 2), 15000 * 4, dtype=np.uint16)
+        under = np.full((2, 2), 100 * 4, dtype=np.uint16)
+        assert np.all(np.isnan(apply_calibration(over, cal, clip=False)))
+        assert np.all(np.isnan(apply_calibration(under, cal, clip=False)))
+
+    def test_clip_false_leaves_in_range_untouched(self):
+        cal = _make_cal(tmin=-20.0, tmax=55.0, counts_min=2000.0, counts_max=12000.0)
+        mid = np.full((2, 2), 7000 * 4, dtype=np.uint16)
+        a = apply_calibration(mid, cal, clip=True)
+        b = apply_calibration(mid, cal, clip=False)
+        assert np.allclose(a, b)
+        assert not np.any(np.isnan(b))
